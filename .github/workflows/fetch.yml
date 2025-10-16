@@ -1,8 +1,8 @@
-name: Fetch nflfastR from GitHub Mirror
+name: Fetch nflfastR from GitHub Raw
 
 on:
   schedule:
-    - cron: "0 16 * * *"
+    - cron: "0 16 * * *"   # daily 10:00 AM America/Edmonton (16:00 UTC)
   workflow_dispatch: {}
 
 concurrency:
@@ -20,18 +20,28 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Pull nflverse mirror (sparse checkout)
+      - name: Create target folder
+        shell: bash
+        run: |
+          mkdir -p data/raw/nflverse__nflfastR-play-by-play-data
+
+      - name: Download nflfastR play-by-play by season
         shell: bash
         run: |
           set -e
-          rm -rf tmp_nflverse
-          git clone --depth 1 https://github.com/nflverse/nflfastR-data.git tmp_nflverse
-          mkdir -p data/raw/nflverse__nflfastR-play-by-play-data
-          # Copy season CSVs (adjust patterns if you want parquet)
-          rsync -av --include="*/" --include="*play_by_play_*.csv.gz" --exclude="*" \
-            tmp_nflverse/data/ \
-            data/raw/nflverse__nflfastR-play-by-play-data/
-          echo "Mirror copy complete."
+          BASE="https://raw.githubusercontent.com/nflverse/nflfastR-data/master/data"
+          OUT="data/raw/nflverse__nflfastR-play-by-play-data"
+          # Adjust end year as new seasons publish
+          for Y in $(seq 1999 2025); do
+            URL="$BASE/play_by_play_${Y}.csv.gz"
+            FILE="$OUT/play_by_play_${Y}.csv.gz"
+            echo "Fetching $URL"
+            if curl -fsSL -o "$FILE" "$URL"; then
+              echo "Saved $FILE"
+            else
+              echo "Not available for $Y (skipping)"
+            fi
+          done
 
       - name: Rebase on latest main
         shell: bash
@@ -46,7 +56,7 @@ jobs:
           git add -A
           if git diff --cached --quiet; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "No local changes after mirror sync."
+            echo "No local changes after download."
           else
             echo "changed=true"  >> "$GITHUB_OUTPUT"
             echo "Changes detected, will commit."
@@ -58,5 +68,5 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore: refresh nflverse github mirror"
+          git commit -m "chore: refresh nflverse raw play-by-play"
           git push || (git pull --rebase origin main && git push)
