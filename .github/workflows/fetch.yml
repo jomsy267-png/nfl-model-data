@@ -34,4 +34,59 @@ jobs:
           KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
           KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
         run: |
-          mkdir -p ~/.
+          mkdir -p ~/.kaggle
+          printf '{"username":"%s","key":"%s"}' "$KAGGLE_USERNAME" "$KAGGLE_KEY" > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+
+      - name: Ensure folders
+        run: mkdir -p data/raw
+
+      - name: Download datasets from datasets.txt
+        shell: bash
+        run: |
+          if [ ! -f datasets.txt ]; then
+            echo "datasets.txt not found at repo root"; exit 1
+          fi
+          while IFS= read -r line; do
+            ds="$(echo "$line" | sed 's#/*$##')"
+            [[ -z "$ds" || "$ds" =~ ^# || "$ds" != */* ]] && continue
+            owner="${ds%%/*}"; slug="${ds#*/}"
+            out="data/raw/${owner}__${slug}"
+            mkdir -p "$out"
+            echo "==> Downloading $ds"
+            if ! kaggle datasets download -d "$ds" -p "$out" -q; then
+              echo "NOTE: Could not download $ds (accept rules on Kaggle?)"
+              continue
+            fi
+            shopt -s nullglob
+            for z in "$out"/*.zip; do
+              echo "Unzipping $(basename "$z")"
+              unzip -o "$z" -d "$out" && rm -f "$z" || true
+            done
+          done < datasets.txt
+
+      - name: Rebase on latest main
+        shell: bash
+        run: |
+          git fetch origin main
+          git pull --rebase origin main || true
+
+      - name: Check for changes
+        id: changes
+        shell: bash
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit & push updates
+        if: steps.changes.outputs.changed == 'true'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: refresh Kaggle datasets"
+          git push || (git pull --rebase origin main && git push)
