@@ -1,4 +1,4 @@
-name: Fetch nflfastR from GitHub Raw
+name: Fetch nflfastR PBP from Releases
 
 on:
   schedule:
@@ -22,24 +22,25 @@ jobs:
 
       - name: Create target folder
         shell: bash
-        run: |
-          mkdir -p data/raw/nflverse__nflfastR-play-by-play-data
+        run: mkdir -p data/raw/nflverse__nflfastR-play-by-play-data
 
-      - name: Download nflfastR play-by-play by season
+      - name: Download PBP CSVs from nflverse releases
         shell: bash
         run: |
           set -e
-          BASE="https://raw.githubusercontent.com/nflverse/nflfastR-data/master/data"
           OUT="data/raw/nflverse__nflfastR-play-by-play-data"
+          base="https://github.com/nflverse/nflverse-data/releases/download/pbp"
           # Adjust end year as new seasons publish
           for Y in $(seq 1999 2025); do
-            URL="$BASE/play_by_play_${Y}.csv.gz"
-            FILE="$OUT/play_by_play_${Y}.csv.gz"
-            echo "Fetching $URL"
-            if curl -fsSL -o "$FILE" "$URL"; then
-              echo "Saved $FILE"
+            url="$base/play_by_play_${Y}.csv.gz"
+            file="$OUT/play_by_play_${Y}.csv.gz"
+            echo "Fetching $url"
+            if curl -fL --retry 3 --retry-delay 2 -o "$file.tmp" "$url"; then
+              mv "$file.tmp" "$file"
+              echo "Saved $file"
             else
               echo "Not available for $Y (skipping)"
+              rm -f "$file.tmp"
             fi
           done
 
@@ -68,5 +69,5 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore: refresh nflverse raw play-by-play"
+          git commit -m "chore: refresh nflverse pbp (releases)"
           git push || (git pull --rebase origin main && git push)
