@@ -1,0 +1,74 @@
+name: Build NFL Features (team-week)
+
+on:
+  workflow_dispatch: {}
+  workflow_run:
+    workflows: ["Fetch nflfastR PBP from Releases"]  # runs after your fetch workflow completes
+    types: [completed]
+  schedule:
+    - cron: "30 16 * * *"   # 10:30 AM Edmonton (after the fetch cron)
+
+concurrency:
+  group: build-features
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify raw files exist
+        shell: bash
+        run: |
+          ls -l data/raw/nflverse__nflfastR-play-by-play-data/*.csv.gz 2>/dev/null || {
+            echo "::error::No raw play_by_play_*.csv.gz files found. Run the fetch workflow first."
+            exit 1
+          }
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy
+
+      - name: Build features
+        run: |
+          python scripts/process_pbp.py
+
+      - name: Rebase on latest main
+        shell: bash
+        run: |
+          git fetch origin main
+          git pull --rebase origin main || true
+
+      - name: Stage files and detect changes
+        id: diff
+        shell: bash
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No changes in processed features."
+          else
+            echo "changed=true"  >> "$GITHUB_OUTPUT"
+            git status --short
+          fi
+
+      - name: Commit & push processed data
+        if: steps.diff.outputs.changed == 'true'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "feat: update team_week_features.csv"
+          git push || (git pull --rebase origin main && git push)
