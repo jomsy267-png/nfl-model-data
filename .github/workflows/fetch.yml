@@ -3,7 +3,7 @@ name: Fetch Kaggle NFL Data
 on:
   schedule:
     - cron: "0 16 * * *"   # daily 10:00 AM America/Edmonton (16:00 UTC)
-  workflow_dispatch: {}     # manual trigger
+  workflow_dispatch: {}     # manual trigger button in Actions tab
 
 concurrency:
   group: data-refresh
@@ -18,7 +18,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0    # full history so rebase/pull works
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -71,22 +71,24 @@ jobs:
           git fetch origin main
           git pull --rebase origin main || true
 
-      - name: Check for changes
-        id: changes
+      - name: Stage files and detect changes
+        id: diff
         shell: bash
         run: |
-          if [ -n "$(git status --porcelain)" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
+          git add -A
+          if git diff --cached --quiet; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No local changes after download/unzip."
+          else
+            echo "changed=true"  >> "$GITHUB_OUTPUT"
+            echo "Changes detected, will commit."
           fi
 
       - name: Commit & push updates
-        if: steps.changes.outputs.changed == 'true'
+        if: steps.diff.outputs.changed == 'true'
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
           git commit -m "chore: refresh Kaggle datasets"
           git push || (git pull --rebase origin main && git push)
