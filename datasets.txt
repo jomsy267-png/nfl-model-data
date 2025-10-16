@@ -1,2 +1,2 @@
-rbhagat/nflfastR-play-by-play
+nflverse/nflfastR-play-by-play-data
 nfl-big-data-bowl-2024/nfl-big-data-bowl-2024
