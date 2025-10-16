@@ -3,7 +3,7 @@ name: Fetch Kaggle NFL Data
 on:
   schedule:
     - cron: "0 16 * * *"   # daily 10:00 AM America/Edmonton (16:00 UTC)
-  workflow_dispatch: {}     # manual trigger button in Actions tab
+  workflow_dispatch: {}
 
 concurrency:
   group: data-refresh
@@ -18,7 +18,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0    # full history so rebase/pull works
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -38,6 +38,22 @@ jobs:
           printf '{"username":"%s","key":"%s"}' "$KAGGLE_USERNAME" "$KAGGLE_KEY" > ~/.kaggle/kaggle.json
           chmod 600 ~/.kaggle/kaggle.json
 
+      - name: Kaggle API sanity check
+        shell: bash
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+        run: |
+          echo "Using Kaggle username: $KAGGLE_USERNAME"
+          # Verify CLI sees auth and can hit the API (this prints a few lines)
+          if ! kaggle datasets list -s nflverse -p 1 | head -n 5; then
+            echo "::error::Kaggle API call failed."
+            echo "::error::Most common causes:"
+            echo "::error::1) Wrong KAGGLE_USERNAME/KAGGLE_KEY or trailing spaces."
+            echo "::error::2) Secrets added as Variables (not Secrets)."
+            echo "::error::3) Token regenerated on Kaggle but old key still in Secrets."
+            exit 1
+          fi
+
       - name: Ensure folders
         run: mkdir -p data/raw
 
@@ -55,8 +71,9 @@ jobs:
             mkdir -p "$out"
             echo "==> Downloading $ds"
             if ! kaggle datasets download -d "$ds" -p "$out" -q; then
-              echo "NOTE: Could not download $ds (accept rules on Kaggle?)"
-              continue
+              echo "::error::Download failed for $ds"
+              echo "::error::If this is a competition dataset, you must Join/Accept rules (old/archived comps cannot be joined)."
+              exit 1
             fi
             shopt -s nullglob
             for z in "$out"/*.zip; do
