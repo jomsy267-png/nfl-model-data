@@ -1,0 +1,66 @@
+name: Fetch Kaggle NFL Data
+
+on:
+  schedule:
+    - cron: "0 16 * * *"   # daily 10:00 AM America/Edmonton (16:00 UTC)
+  workflow_dispatch: {}     # allows manual run from Actions tab
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # allow committing data
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Kaggle CLI
+        run: pip install kaggle
+
+      - name: Configure Kaggle credentials
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: |
+          mkdir -p ~/.kaggle
+          echo "{\"username\":\"${KAGGLE_USERNAME}\",\"key\":\"${KAGGLE_KEY}\"}" > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+
+      - name: Ensure folders
+        run: mkdir -p data/raw
+
+      - name: Download datasets from datasets.txt
+        shell: bash
+        run: |
+          while IFS= read -r line; do
+            ds="$(echo "$line" | sed 's#/*$##')"
+            # skip blanks, comments, and malformed lines
+            [[ -z "$ds" || "$ds" =~ ^# || "$ds" != */* ]] && continue
+            owner="${ds%%/*}"; slug="${ds#*/}"
+            out="data/raw/${owner}__${slug}"
+            mkdir -p "$out"
+            echo "==> Downloading $ds"
+            if ! kaggle datasets download -d "$ds" -p "$out" -q; then
+              echo "NOTE: Could not download $ds (accept rules on Kaggle?)"
+              continue
+            fi
+            # unzip any archives
+            shopt -s nullglob
+            for z in "$out"/*.zip; do
+              echo "Unzipping $(basename "$z")"
+              unzip -o "$z" -d "$out" && rm -f "$z" || true
+            done
+          done < datasets.txt
+
+      - name: Commit & push updates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: refresh Kaggle datasets" || echo "No changes to commit"
+          git push
