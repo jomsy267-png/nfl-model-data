@@ -1,8 +1,8 @@
-name: Fetch Kaggle NFL Data
+name: Fetch nflfastR from GitHub Mirror
 
 on:
   schedule:
-    - cron: "0 16 * * *"   # daily 10:00 AM America/Edmonton (16:00 UTC)
+    - cron: "0 16 * * *"
   workflow_dispatch: {}
 
 concurrency:
@@ -20,67 +20,18 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install Kaggle CLI
-        run: pip install kaggle
-
-      - name: Configure Kaggle credentials
-        shell: bash
-        env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
-        run: |
-          mkdir -p ~/.kaggle
-          printf '{"username":"%s","key":"%s"}' "$KAGGLE_USERNAME" "$KAGGLE_KEY" > ~/.kaggle/kaggle.json
-          chmod 600 ~/.kaggle/kaggle.json
-
-      - name: Kaggle API sanity check
-        shell: bash
-        env:
-          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-        run: |
-          echo "Using Kaggle username: $KAGGLE_USERNAME"
-          # Verify CLI sees auth and can hit the API (this prints a few lines)
-          if ! kaggle datasets list -s nflverse -p 1 | head -n 5; then
-            echo "::error::Kaggle API call failed."
-            echo "::error::Most common causes:"
-            echo "::error::1) Wrong KAGGLE_USERNAME/KAGGLE_KEY or trailing spaces."
-            echo "::error::2) Secrets added as Variables (not Secrets)."
-            echo "::error::3) Token regenerated on Kaggle but old key still in Secrets."
-            exit 1
-          fi
-
-      - name: Ensure folders
-        run: mkdir -p data/raw
-
-      - name: Download datasets from datasets.txt
+      - name: Pull nflverse mirror (sparse checkout)
         shell: bash
         run: |
-          if [ ! -f datasets.txt ]; then
-            echo "datasets.txt not found at repo root"; exit 1
-          fi
-          while IFS= read -r line; do
-            ds="$(echo "$line" | sed 's#/*$##')"
-            [[ -z "$ds" || "$ds" =~ ^# || "$ds" != */* ]] && continue
-            owner="${ds%%/*}"; slug="${ds#*/}"
-            out="data/raw/${owner}__${slug}"
-            mkdir -p "$out"
-            echo "==> Downloading $ds"
-            if ! kaggle datasets download -d "$ds" -p "$out" -q; then
-              echo "::error::Download failed for $ds"
-              echo "::error::If this is a competition dataset, you must Join/Accept rules (old/archived comps cannot be joined)."
-              exit 1
-            fi
-            shopt -s nullglob
-            for z in "$out"/*.zip; do
-              echo "Unzipping $(basename "$z")"
-              unzip -o "$z" -d "$out" && rm -f "$z" || true
-            done
-          done < datasets.txt
+          set -e
+          rm -rf tmp_nflverse
+          git clone --depth 1 https://github.com/nflverse/nflfastR-data.git tmp_nflverse
+          mkdir -p data/raw/nflverse__nflfastR-play-by-play-data
+          # Copy season CSVs (adjust patterns if you want parquet)
+          rsync -av --include="*/" --include="*play_by_play_*.csv.gz" --exclude="*" \
+            tmp_nflverse/data/ \
+            data/raw/nflverse__nflfastR-play-by-play-data/
+          echo "Mirror copy complete."
 
       - name: Rebase on latest main
         shell: bash
@@ -95,7 +46,7 @@ jobs:
           git add -A
           if git diff --cached --quiet; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "No local changes after download/unzip."
+            echo "No local changes after mirror sync."
           else
             echo "changed=true"  >> "$GITHUB_OUTPUT"
             echo "Changes detected, will commit."
@@ -107,5 +58,5 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit -m "chore: refresh Kaggle datasets"
+          git commit -m "chore: refresh nflverse github mirror"
           git push || (git pull --rebase origin main && git push)
