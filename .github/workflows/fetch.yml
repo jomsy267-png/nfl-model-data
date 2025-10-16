@@ -3,7 +3,7 @@ name: Fetch Kaggle NFL Data
 on:
   schedule:
     - cron: "0 16 * * *"   # daily 10:00 AM America/Edmonton (16:00 UTC)
-  workflow_dispatch: {}     # allows manual run from Actions tab
+  workflow_dispatch: {}     # manual trigger
 
 concurrency:
   group: data-refresh
@@ -13,16 +13,25 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     permissions:
-      contents: write       # allow committing data
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0    # needed for pull/rebase
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Kag
+      - name: Install Kaggle CLI
+        run: pip install kaggle
+
+      - name: Configure Kaggle credentials
+        shell: bash
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        run: |
+          mkdir -p ~/.
