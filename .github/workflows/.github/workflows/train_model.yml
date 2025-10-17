@@ -1,0 +1,55 @@
+name: Train NFL Model
+
+on:
+  workflow_run:
+    workflows: ["Fetch nflfastR PBP from Releases", "Fetch NFL Results & Closing Lines"]
+    types: [completed]
+  schedule:
+    - cron: "45 16 * * *"   # 10:45 AM Edmonton (after both fetchers)
+  workflow_dispatch: {}
+
+concurrency:
+  group: train-model
+  cancel-in-progress: true
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    permissions: { contents: write }
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Verify inputs
+        shell: bash
+        run: |
+          test -f data/processed/team_week_features.csv || (echo "Missing processed features"; exit 1)
+          ls data/external/games_*.csv.gz >/dev/null 2>&1 || (echo "Missing games files"; exit 1)
+          ls data/external/lines_*.csv.gz >/dev/null 2>&1 || (echo "Missing lines files"; exit 1)
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy scikit-learn
+
+      - name: Train model
+        run: python scripts/train_model.py
+
+      - name: Commit artifacts
+        shell: bash
+        run: |
+          git fetch origin main
+          git pull --rebase origin main || true
+          git add models/*.json models/latest_team_features.csv
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -m "feat: retrain NFL model"
+            git push || (git pull --rebase origin main && git push)
+          fi
