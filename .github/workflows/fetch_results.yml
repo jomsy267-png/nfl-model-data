@@ -2,7 +2,7 @@ name: Fetch NFL Schedules (scores + closing lines)
 
 on:
   schedule:
-    - cron: "15 16 * * *"   # 10:15 AM Edmonton (after the PBP fetch)
+    - cron: "15 16 * * *"   # 10:15 AM Edmonton
   workflow_dispatch: {}
 
 concurrency:
@@ -23,29 +23,37 @@ jobs:
         shell: bash
         run: mkdir -p data/external
 
-      - name: Download schedules (includes scores + closing lines)
+      - name: Download schedules (scores + closing lines)
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           BASE="https://github.com/nflverse/nflverse-data/releases/download/schedules"
           for Y in $(seq 1999 2025); do
-            ok=0
+            saved=""
             for FN in "schedules_${Y}.csv.gz" "schedules_${Y}.csv" "schedule_${Y}.csv.gz" "schedule_${Y}.csv"; do
-              echo "Trying $BASE/$FN"
-              if curl -fL --retry 3 --retry-delay 2 -o "data/external/$FN" "$BASE/$FN"; then
+              URL="$BASE/$FN"
+              echo "Trying $URL"
+              if curl -fL --retry 3 --retry-delay 2 -o "data/external/$FN" "$URL"; then
                 echo "Saved data/external/$FN"
-                ok=1
+                saved="$FN"
                 break
               fi
             done
-            if [ $ok -eq 0 ]; then
+            if [ -z "$saved" ]; then
               echo "No schedules file for $Y (skipping)"
             fi
           done
 
+      - name: Show what we downloaded
+        shell: bash
+        run: |
+          echo "Files in data/external:"
+          ls -lah data/external || true
+
       - name: Rebase & commit if changed
         shell: bash
         run: |
+          set -euo pipefail
           git fetch origin main
           git pull --rebase origin main || true
           git add -A
@@ -55,4 +63,6 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git commit -m "chore: refresh schedules (scores + closing lines)"
+            # retry-on-race once
             git push || (git pull --rebase origin main && git push)
+          fi
