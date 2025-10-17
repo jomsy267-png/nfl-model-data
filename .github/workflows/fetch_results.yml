@@ -1,0 +1,59 @@
+name: Fetch NFL Schedules (scores + closing lines)
+
+on:
+  schedule:
+    - cron: "15 16 * * *"   # 10:15 AM Edmonton
+  workflow_dispatch: {}
+
+concurrency:
+  group: fetch-results
+  cancel-in-progress: true
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create targets
+        shell: bash
+        run: mkdir -p data/external
+
+      - name: Download schedules (includes scores + closing lines)
+        shell: bash
+        run: |
+          set -e
+          BASE="https://github.com/nflverse/nflverse-data/releases/download/schedules"
+          for Y in $(seq 1999 2025); do
+            ok=0
+            for FN in "schedules_${Y}.csv.gz" "schedules_${Y}.csv" "schedule_${Y}.csv.gz" "schedule_${Y}.csv"; do
+              echo "Trying $BASE/$FN"
+              if curl -fL --retry 3 --retry-delay 2 -o "data/external/$FN" "$BASE/$FN"; then
+                echo "Saved data/external/$FN"
+                ok=1
+                break
+              fi
+            done
+            if [ $ok -eq 0 ]; then
+              echo "No schedules file for $Y (skipping)"
+            fi
+          done
+
+      - name: Commit if changed
+        shell: bash
+        run: |
+          git fetch origin main
+          git pull --rebase origin main || true
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore: refresh schedules (scores + closing lines)"
+            git push || (git pull --rebase origin main && git push)
+          fi
