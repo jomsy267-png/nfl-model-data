@@ -2,7 +2,7 @@ name: Fetch NFL Schedules (scores + closing lines)
 
 on:
   schedule:
-    - cron: "15 16 * * *"   # 10:15 AM Edmonton
+    - cron: "15 16 * * *"   # 10:15 AM Edmonton (after the PBP fetch)
   workflow_dispatch: {}
 
 concurrency:
@@ -43,7 +43,7 @@ jobs:
             fi
           done
 
-      - name: Commit if changed
+      - name: Rebase & commit if changed
         shell: bash
         run: |
           git fetch origin main
@@ -56,4 +56,3 @@ jobs:
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git commit -m "chore: refresh schedules (scores + closing lines)"
             git push || (git pull --rebase origin main && git push)
-          fi
