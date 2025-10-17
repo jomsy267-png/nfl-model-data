@@ -1,11 +1,16 @@
 name: Train NFL Model
 
 on:
+  # Auto-train after either fetch workflow completes
   workflow_run:
-    workflows: ["Fetch nflfastR PBP from Releases", "Fetch NFL Results & Closing Lines"]
+    workflows:
+      - "Fetch nflfastR PBP from Releases"
+      - "Fetch NFL Schedules (scores + closing lines)"
     types: [completed]
+  # Daily safety run (after your 16:00/16:15 cron fetchers)
   schedule:
-    - cron: "45 16 * * *"   # 10:45 AM Edmonton (after both fetchers)
+    - cron: "45 16 * * *"
+  # Manual button
   workflow_dispatch: {}
 
 concurrency:
@@ -15,23 +20,30 @@ concurrency:
 jobs:
   train:
     runs-on: ubuntu-latest
-    permissions: { contents: write }
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Verify inputs
         shell: bash
         run: |
+          set -e
           test -f data/processed/team_week_features.csv || (echo "Missing processed features"; exit 1)
-          ls data/external/games_*.csv.gz >/dev/null 2>&1 || (echo "Missing games files"; exit 1)
-          ls data/external/lines_*.csv.gz >/dev/null 2>&1 || (echo "Missing lines files"; exit 1)
+          # schedules release contains scores + closing lines
+          ls data/external/schedules_*.csv* >/dev/null 2>&1 || \
+          ls data/external/schedule_*.csv*  >/dev/null 2>&1 || \
+          (echo "Missing schedules files (scores + closing lines). Run the schedules fetch workflow first."; exit 1)
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install pandas numpy scikit-learn
@@ -39,12 +51,17 @@ jobs:
       - name: Train model
         run: python scripts/train_model.py
 
-      - name: Commit artifacts
+      - name: Rebase on latest main
         shell: bash
         run: |
           git fetch origin main
           git pull --rebase origin main || true
-          git add models/*.json models/latest_team_features.csv
+
+      - name: Commit & push artifacts
+        shell: bash
+        run: |
+          set -e
+          git add models/nfl_model.json models/training_metrics.json models/latest_team_features.csv || true
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
@@ -53,3 +70,12 @@ jobs:
             git commit -m "feat: retrain NFL model"
             git push || (git pull --rebase origin main && git push)
           fi
+
+      - name: Upload artifacts (optional download)
+        uses: actions/upload-artifact@v4
+        with:
+          name: nfl-model-artifacts
+          path: |
+            models/nfl_model.json
+            models/training_metrics.json
+            models/latest_team_features.csv
