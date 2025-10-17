@@ -2,7 +2,7 @@ name: Fetch NFL Schedules (scores + closing lines)
 
 on:
   schedule:
-    - cron: "15 16 * * *"   # 10:15 AM Edmonton (after PBP fetch)
+    - cron: "15 16 * * *"   # 10:15 AM America/Edmonton (after PBP fetch)
   workflow_dispatch: {}
 
 concurrency:
@@ -49,24 +49,22 @@ jobs:
           cd data/external
           IN="$AGG_FILE"
           TMP="schedules_all.csv"
-          # gunzip if needed
           if [[ "$IN" == *.gz ]]; then
             gzip -dc "$IN" > "$TMP"
           else
             cp "$IN" "$TMP"
           fi
-          # Split by season to schedules_YYYY.csv.gz
           python - << 'PY'
 import pandas as pd, os
 df = pd.read_csv("schedules_all.csv")
 if "season" not in df.columns:
-    raise SystemExit("schedules_all.csv missing 'season' column")
-years = sorted(int(y) for y in df["season"].dropna().unique())
-for y in years:
+    raise SystemExit("schedules_all.csv missing 'season'")
+for y in sorted(df["season"].dropna().unique()):
+    y = int(y)
     out = f"schedules_{y}.csv"
     df[df["season"]==y].to_csv(out, index=False)
     os.system(f"gzip -f '{out}'")
-print("Wrote per-season gz files:", years)
+print("split-done")
 PY
           rm -f schedules_all.csv
 
@@ -98,7 +96,6 @@ PY
         run: |
           echo "Files in data/external:"
           ls -lah data/external || true
-          echo "Sample head (one season if present):"
           f=$(ls data/external/schedules_*.csv.gz 2>/dev/null | head -n 1 || true)
           if [ -n "$f" ]; then gzip -dc "$f" | head -n 5; fi
 
