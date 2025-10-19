@@ -85,6 +85,82 @@ jobs:
             data/external/schedules_2025.csv
           retention-days: 7
 
+  fetch_rosters:
+    name: Fetch rosters (2025)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print current times (UTC & Edmonton)
+        run: |
+          echo "UTC:       $(date -u)"
+          TZ=America/Edmonton date +"%Y-%m-%d %H:%M:%S %Z"
+
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          # nflreadpy is primary; fallback to nfl_data_py only if needed
+          pip install nflreadpy polars pandas nfl_data_py
+
+      - name: Download 2025 rosters (primary nflreadpy; fallback nfl_data_py)
+        run: |
+          python - << 'PY'
+          import os, sys, polars as pl
+          os.makedirs("data/external", exist_ok=True)
+          YEAR = 2025
+
+          def save(df):
+              if "season" in df.columns:
+                  df = df.with_columns(pl.col("season").cast(pl.Int32, strict=False))
+              df.write_csv(f"data/external/rosters_{YEAR}.csv")
+              print(f"✅ Wrote data/external/rosters_{YEAR}.csv with {df.height} rows")
+
+          # Try nflreadpy first (dataset name depends on backend; try common paths)
+          try:
+              import nflreadpy as nfl
+              # Some installs expose load_rosters, some expose load_players with seasons
+              if hasattr(nfl, "load_rosters"):
+                  df_any = nfl.load_rosters(seasons=[YEAR])
+              elif hasattr(nfl, "load_players"):
+                  df_any = nfl.load_players(seasons=[YEAR])
+              else:
+                  raise RuntimeError("nflreadpy has no load_rosters/load_players")
+              try:
+                  import pandas as pd
+                  df_pl = pl.from_pandas(df_any) if hasattr(df_any, "to_dict") else df_any
+              except Exception:
+                  df_pl = pl.DataFrame(df_any)
+              if "season" in df_pl.columns:
+                  df_pl = df_pl.filter(pl.col("season")==YEAR)
+              if df_pl.height == 0:
+                  raise RuntimeError("Empty roster for 2025 via nflreadpy")
+              save(df_pl)
+          except Exception as e:
+              print(f"[WARN] nflreadpy roster load failed: {e}", file=sys.stderr)
+              try:
+                  import nfl_data_py as ndp, pandas as pd
+                  df_pd = ndp.import_players()
+                  df_pl = pl.from_pandas(df_pd)
+                  # This is a career players table; keep as-is for now
+                  save(df_pl)
+              except Exception as e2:
+                  print(f"[ERROR] fallback roster load failed: {e2}", file=sys.stderr)
+                  sys.exit(2)
+          PY
+
+      - name: Upload rosters artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rosters
+          path: data/external/rosters_2025.csv
+          retention-days: 7
+
+
   fetch_pbp:
     name: Fetch play-by-play (last 4 seasons)
     runs-on: ubuntu-latest
