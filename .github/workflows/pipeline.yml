@@ -552,9 +552,10 @@ jobs:
         with:
           name: backtest
           path: models
+        continue-on-error: true
 
       - name: Build short Discord message (<= 2000 chars)
-        id: msg
+        id: build_msg
         shell: bash
         run: |
           set -euo pipefail
@@ -563,7 +564,6 @@ jobs:
           RUN="${GITHUB_RUN_NUMBER}"
           DATE_UTC="$(date -u '+%Y-%m-%d %H:%M UTC')"
 
-          # Compose a compact text body
           {
             echo "**NFL Daily — ${REPO} #${RUN}**"
             echo "_${DATE_UTC}_"
@@ -581,11 +581,17 @@ jobs:
             echo "_Full files attached below._"
           } > discord_message.txt
 
-          # Truncate to Discord hard limit (2000 chars) just in case
+          # Trim to Discord hard limit
           head -c 1900 discord_message.txt > discord_message_trimmed.txt
-          echo "path=discord_message_trimmed.txt" >> "$GITHUB_OUTPUT"
 
-      # Post message + attach files via webhook (multipart form-data)
+      - name: Build payload.json (no Python)
+        shell: bash
+        run: |
+          # Create {"content": "<trimmed message>"} using jq
+          jq -Rs '{content: .}' < discord_message_trimmed.txt > payload.json
+          echo "payload.json built:"
+          head -c 200 payload.json && echo
+
       - name: Send to Discord (message + attachments)
         shell: bash
         env:
@@ -593,20 +599,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Ensure at least a message
-          test -s discord_message_trimmed.txt || echo "NFL Daily report" > discord_message_trimmed.txt
+          if [ -z "${WEBHOOK:-}" ]; then
+            echo "ERROR: Missing DISCORD_WEBHOOK_URL secret"
+            exit 1
+          fi
 
-          # Build a minimal JSON payload (content only)
-          printf '{"content": %s}\n' "$(jq -Rs . < discord_message_trimmed.txt)" > payload.json || {
-            # Fallback if jq isn't available (should be, but just in case)
-            python - <<'PY'
-import json,sys
-txt=open('discord_message_trimmed.txt','r',encoding='utf-8').read()
-open('payload.json','w',encoding='utf-8').write(json.dumps({"content":txt}))
-PY
-          }
-
-          # Prepare attachment flags (Discord webhooks allow multiple files)
           files=()
           i=1
           attach_if_exists () {
@@ -619,12 +616,13 @@ PY
           attach_if_exists "models/predictions.csv"
           attach_if_exists "models/backtest_report.md"
 
-          # Send via webhook
+          # Send via webhook (multipart/form-data)
           curl -sS -X POST "$WEBHOOK" \
             -H "Content-Type: multipart/form-data" \
-            -F "payload_json=@payload.json" \
-            "${files[@]:-}" \
-            | sed -e 's/.*//'
+            -F "payload_json=@payload.json;type=application/json" \
+            "${files[@]}" >/dev/null
 
           echo "Sent Discord message with $((i-1)) attachments."
+
+
 
