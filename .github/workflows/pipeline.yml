@@ -243,7 +243,7 @@ jobs:
 
 
   predict_and_report:
-    name: Score upcoming games + report (pure Polars, no NumPy)
+    name: Score upcoming games + report (pure Polars, null-safe)
     needs: [train]
     runs-on: ubuntu-latest
     steps:
@@ -276,10 +276,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install polars
 
-      - name: Predict using saved logistic model + make report (no numpy/pandas)
+      - name: Predict using saved logistic model + make report (null-safe, no numpy)
         run: |
           python - << 'PY'
-          import json, math, os, sys, polars as pl
+          import json, os, sys, polars as pl
 
           # Load model
           try:
@@ -290,6 +290,18 @@ jobs:
             os.makedirs("models", exist_ok=True)
             with open("models/predictions.csv","w") as f: f.write("note\nno model available\n")
             with open("models/report.md","w") as f: f.write("# NFL Model Report\n\n_No model available._\n")
+            sys.exit(0)
+
+          feats = model.get("features", [])
+          coef = model.get("coef", [])
+          intercept = float(model.get("intercept", 0.0))
+
+          if not feats or not coef or len(feats) != len(coef):
+            os.makedirs("models", exist_ok=True)
+            with open("models/predictions.csv","w") as f:
+              f.write("note\nmodel has no usable features\n")
+            with open("models/report.md","w") as f:
+              f.write("# NFL Model Report\n\n_Model has no usable features; predictions skipped._\n")
             sys.exit(0)
 
           # Choose features file (prefer latest; fallback to full features)
@@ -305,38 +317,27 @@ jobs:
 
           df = pl.read_csv(features_path)
 
-          feats = model.get("features", [])
-          coef = model.get("coef", [])
-          intercept = float(model.get("intercept", 0.0))
-
-          if not feats or not coef or len(feats) != len(coef):
-            os.makedirs("models", exist_ok=True)
-            with open("models/predictions.csv","w") as f:
-              f.write("note\nmodel has no usable features\n")
-            with open("models/report.md","w") as f:
-              f.write("# NFL Model Report\n\n_Model has no usable features; predictions skipped._\n")
-            sys.exit(0)
-
-          # Ensure all feature columns exist (fill missing with 0.0)
+          # Ensure all feature columns exist and are float, fill nulls with 0.0
           for c in feats:
             if c not in df.columns:
               df = df.with_columns(pl.lit(0.0).alias(c))
+          df = df.with_columns([pl.col(c).cast(pl.Float64).fill_null(0.0) for c in feats])
 
-          # Compute probabilities without NumPy: iterate rows
-          def sigmoid(z): return 1.0 / (1.0 + math.exp(-z))
-          probs = []
-          for row in df.select(feats).iter_rows():
-            z = intercept + sum(ci * float(xi) for ci, xi in zip(coef, row))
-            probs.append(sigmoid(z))
+          # Build logit = intercept + sum_i coef_i * feature_i using Polars expressions
+          logit = pl.lit(float(intercept))
+          for c, w in zip(feats, coef):
+            logit = logit + pl.col(c) * float(w)
 
-          # Build output table
+          # Probability: 1 / (1 + exp(-logit))
+          prob = (1 / (1 + (-logit).exp())).alias("home_win_prob")
+
           base_cols = [c for c in ["season","week","game_id","home_team","away_team","spread_line","total_line","implied_margin","implied_total"] if c in df.columns]
-          out = df.select(base_cols).with_columns(pl.Series("home_win_prob", probs)).sort("home_win_prob", descending=True)
+          out = df.select(base_cols + [prob]).sort("home_win_prob", descending=True)
 
           os.makedirs("models", exist_ok=True)
           out.write_csv("models/predictions.csv")
 
-          # Load metrics (if present) for the report
+          # Try load metrics
           metrics = {}
           try:
             with open("models/training_metrics.json") as f:
@@ -344,7 +345,7 @@ jobs:
           except Exception:
             pass
 
-          # Render markdown report (top 5 by prob)
+          # Simple markdown report (top 5 by prob)
           def fmt(v, nd=3):
             try:
               return f"{float(v):.{nd}f}"
@@ -352,10 +353,7 @@ jobs:
               return str(v)
 
           top = out.head(5)
-          lines = []
-          lines.append("# NFL Model Report")
-          lines.append("")
-          lines.append("## Metrics")
+          lines = ["# NFL Model Report", "", "## Metrics"]
           if metrics:
             for k in ["train_auc","test_auc","train_logloss","test_logloss","train_acc","test_acc"]:
               if k in metrics:
@@ -367,9 +365,8 @@ jobs:
           if top.height == 0:
             lines.append("_No upcoming games found to score._")
           else:
-            lines.append("")
-            lines.append("| season | week | game_id | home_team | away_team | home_win_prob |")
-            lines.append("|---:|---:|---|---|---|---:|")
+            lines += ["", "| season | week | game_id | home_team | away_team | home_win_prob |",
+                           "|---:|---:|---|---|---|---:|"]
             for r in top.iter_rows(named=True):
               lines.append(f"| {r.get('season','')} | {r.get('week','')} | {r.get('game_id','')} | {r.get('home_team','')} | {r.get('away_team','')} | {fmt(r.get('home_win_prob',0.0),3)} |")
 
@@ -385,5 +382,6 @@ jobs:
             models/predictions.csv
             models/report.md
           retention-days: 30
+
 
 
