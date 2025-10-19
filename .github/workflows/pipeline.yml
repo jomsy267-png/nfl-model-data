@@ -460,14 +460,14 @@ jobs:
           retention-days: 30
 
   predict_and_report:
-    name: Score upcoming games + report (pure Polars, null-safe, calibrated if available)
-    needs: [train, calibrate]
+    name: Score upcoming games + report (blend-aware, null-safe, calibrated)
+    needs: [train, calibrate, blend_models]
     runs-on: ubuntu-latest
     steps:
       - name: Print current times (UTC & Edmonton)
         run: |
           echo "UTC:       $(date -u)"
-          TZ=America/Edmonton date +"Edmonton: %Y-%m-%d %H:%M:%S %Z"
+          TZ=America/Edmonton date +"%Y-%m-%d %H:%M:%S %Z"
 
       - uses: actions/checkout@v4
 
@@ -476,6 +476,20 @@ jobs:
         with:
           name: model_artifacts
           path: models
+
+      - name: Download blended artifacts (optional)
+        uses: actions/download-artifact@v4
+        with:
+          name: blended_artifacts
+          path: models
+        continue-on-error: true
+
+      - name: Download xgb artifacts (for scoring if blended)
+        uses: actions/download-artifact@v4
+        with:
+          name: xgb_artifacts
+          path: models
+        continue-on-error: true
 
       - name: Download features (for context in report)
         uses: actions/download-artifact@v4
@@ -492,42 +506,32 @@ jobs:
 
       - name: Set up Python
         uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install polars
+          pip install polars xgboost numpy
 
-      - name: Predict using saved logistic model + make report (null-safe, optional calibration)
+      - name: Predict + report (blend-aware, null-safe)
         run: |
           python - << 'PY'
-          import json, os, sys, bisect, polars as pl
+          import json, os, sys, bisect
+          import polars as pl
 
-          # Load model
-          try:
-            with open("models/nfl_model.json") as f:
-              model = json.load(f)
-          except Exception as e:
-            print(f"Could not load model: {e}", file=sys.stderr)
-            os.makedirs("models", exist_ok=True)
-            with open("models/predictions.csv","w") as f: f.write("note\nno model available\n")
-            with open("models/report.md","w") as f: f.write("# NFL Model Report\n\n_No model available._\n")
-            sys.exit(0)
+          def load_json(path):
+            with open(path) as f:
+              return json.load(f)
 
-          # Optional calibrator
-          calibrator = None
-          cal_path = "models/calibrator_isotonic.json"
-          if os.path.exists(cal_path):
-            try:
-              with open(cal_path) as f:
-                c = json.load(f)
-                if c.get("type") == "isotonic" and "x_thresholds" in c and "y_values" in c:
-                  calibrator = (c["x_thresholds"], c["y_values"])
-            except Exception:
-              pass
+          # Choose model: blended if available else logistic
+          model = None
+          if os.path.exists("models/blended_model.json"):
+            model = load_json("models/blended_model.json")
+          else:
+            model = load_json("models/nfl_model.json")
 
-          # Choose features file (prefer latest, else full)
+          # Choose features file (prefer latest)
           features_path = "models/latest_team_features.csv"
           if not os.path.exists(features_path):
             features_path = "data/processed/team_week_features.csv"
@@ -540,82 +544,107 @@ jobs:
 
           df = pl.read_csv(features_path)
 
-          feats = model.get("features", [])
-          coef = model.get("coef", [])
-          intercept = float(model.get("intercept", 0.0))
-          if not feats or not coef or len(feats) != len(coef):
-            os.makedirs("models", exist_ok=True)
-            with open("models/predictions.csv","w") as f:
-              f.write("note\nmodel has no usable features\n")
-            with open("models/report.md","w") as f:
-              f.write("# NFL Model Report\n\n_Model has no usable features; predictions skipped._\n")
-            sys.exit(0)
+          # Scoring helpers
+          def ensure_cols(df, cols):
+            for c in cols:
+              if c not in df.columns:
+                df = df.with_columns(pl.lit(0.0).alias(c))
+            return df.with_columns([pl.col(c).cast(pl.Float64).fill_null(0.0) for c in cols])
 
-          # Ensure features exist & are float, fill nulls with 0.0
-          for c in feats:
-            if c not in df.columns:
-              df = df.with_columns(pl.lit(0.0).alias(c))
-          df = df.with_columns([pl.col(c).cast(pl.Float64).fill_null(0.0) for c in feats])
+          def score_logistic_expr(df, feats, coef, intercept):
+            logit = pl.lit(float(intercept))
+            for c, w in zip(feats, coef):
+              logit = logit + pl.col(c) * float(w)
+            return (1 / (1 + (-logit).exp())).alias("p_logit")
 
-          # Raw probability via logistic
-          logit = pl.lit(intercept)
-          for c, w in zip(feats, coef):
-            logit = logit + pl.col(c) * float(w)
-          p_raw = (1 / (1 + (-logit).exp())).alias("p_raw")
+          p_raw_expr = None
 
-          # Apply isotonic calibration if available
+          if model.get("model_type") == "blend_linear" and \
+             os.path.exists("models/nfl_model.json") and \
+             os.path.exists("models/xgb_model.json"):
+
+            # Load components
+            lm = load_json("models/nfl_model.json")
+            xm = load_json("models/xgb_model.json")
+
+            feats_l = lm.get("features", [])
+            feats_x = xm.get("features", [])
+            df = ensure_cols(df, list(dict.fromkeys(feats_l + feats_x)))
+
+            # logistic prob as column
+            p_logit = score_logistic_expr(df, feats_l, lm.get("coef", []), lm.get("intercept", 0.0))
+            df = df.with_columns(p_logit)
+
+            # xgb prob as column (requires numpy + xgboost)
+            import numpy as np, xgboost as xgb
+            dmat = xgb.DMatrix(df.select(feats_x).to_numpy())
+            booster = xgb.Booster(); booster.load_model(bytearray(xm["booster_json"], "utf-8"))
+            p_xgb = booster.predict(dmat)
+            df = df.with_columns(pl.Series("p_xgb", p_xgb))
+
+            a = float(model.get("alpha_logistic", 0.5))
+            p_raw_expr = (a*pl.col("p_logit") + (1-a)*pl.col("p_xgb")).alias("p_raw")
+
+          else:
+            # Fallback: logistic only
+            feats = model.get("features", [])
+            coef  = model.get("coef", [])
+            intercept = model.get("intercept", 0.0)
+            df = ensure_cols(df, feats)
+            p_raw_expr = score_logistic_expr(df, feats, coef, intercept).alias("p_raw")
+
+          # Build p_raw
+          df = df.with_columns(p_raw_expr)
+
+          # Optional isotonic calibration
+          calibrator = None
+          if os.path.exists("models/calibrator_isotonic.json"):
+            try:
+              c = load_json("models/calibrator_isotonic.json")
+              if c.get("type") == "isotonic":
+                calibrator = (c["x_thresholds"], c["y_values"])
+            except Exception:
+              calibrator = None
+
           if calibrator:
             xs, ys = calibrator
             def calibrate_scalar(p):
               i = bisect.bisect_right(xs, float(p)) - 1
-              if i < 0:
-                return float(ys[0])
-              if i >= len(xs) - 1:
-                return float(ys[-1])
-              x0, x1 = xs[i], xs[i+1]
-              y0, y1 = ys[i], ys[i+1]
-              if x1 == x0:
-                return float(y0)
+              if i < 0: return float(ys[0])
+              if i >= len(xs) - 1: return float(ys[-1])
+              x0, x1 = xs[i], xs[i+1]; y0, y1 = ys[i], ys[i+1]
+              if x1 == x0: return float(y0)
               t = (float(p) - x0) / (x1 - x0)
               return float(y0 + t * (y1 - y0))
-            out_prob = pl.col("p_raw").map_elements(calibrate_scalar).alias("home_win_prob")
+            df = df.with_columns(pl.col("p_raw").map_elements(calibrate_scalar).alias("home_win_prob"))
           else:
-            out_prob = p_raw.alias("home_win_prob")
+            df = df.with_columns(pl.col("p_raw").alias("home_win_prob"))
 
+          # Output
           base_cols = [c for c in ["season","week","game_id","home_team","away_team","spread_line","total_line","implied_margin","implied_total"] if c in df.columns]
-          out = df.with_columns(p_raw).select(base_cols + [out_prob]).sort("home_win_prob", descending=True)
+          out = df.select(base_cols + ["home_win_prob"]).sort("home_win_prob", descending=True)
 
           os.makedirs("models", exist_ok=True)
           out.write_csv("models/predictions.csv")
 
-          # Metrics summary (optional)
+          # Minimal markdown
           def fmt(v, nd=3):
             try: return f"{float(v):.{nd}f}"
             except: return str(v)
 
-          metrics = {}
-          try:
-            with open("models/training_metrics.json") as f:
-              metrics = json.load(f)
-          except Exception:
-            pass
-
           top = out.head(5)
-          lines = ["# NFL Model Report", "", "## Metrics"]
-          if metrics:
-            for k in ["train_auc","test_auc","train_logloss","test_logloss","train_acc","test_acc"]:
-              if k in metrics: lines.append(f"- **{k}**: {fmt(metrics[k])}")
-          else:
-            lines.append("_No metrics available_")
-          lines.append("")
-          lines.append(f"## Top 5 upcoming (by {'calibrated ' if calibrator else ''}home_win_prob)")
+          lines = ["# NFL Model Report", "",
+                   f"_Using {'blended' if model.get('model_type')=='blend_linear' else 'logistic'} model_",
+                   "",
+                   "## Top 5 upcoming (by home_win_prob)", ""]
           if top.height == 0:
             lines.append("_No upcoming games found to score._")
           else:
-            lines += ["", "| season | week | game_id | home_team | away_team | home_win_prob |",
-                           "|---:|---:|---|---|---|---:|"]
+            lines.append("| season | week | game_id | home_team | away_team | home_win_prob |")
+            lines.append("|---:|---:|---|---|---|---:|")
             for r in top.iter_rows(named=True):
               lines.append(f"| {r.get('season','')} | {r.get('week','')} | {r.get('game_id','')} | {r.get('home_team','')} | {r.get('away_team','')} | {fmt(r.get('home_win_prob',0.0),3)} |")
+
           with open("models/report.md","w") as f:
             f.write("\n".join(lines))
           PY
