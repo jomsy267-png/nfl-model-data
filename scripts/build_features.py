@@ -39,11 +39,14 @@ def build_team_history(sched: pl.DataFrame) -> pl.DataFrame:
 
     team_games = pl.concat([home, away], how="vertical_relaxed")
 
-    # Ensure proper types
-    if team_games["date"].dtype != pl.Date and team_games["date"].dtype != pl.Datetime:
-        # nflreadpy often emits ISO strings; parse to date
-        team_games = team_games.with_columns(pl.col("date").str.strptime(pl.Date, strict=False))
+    # Ensure proper date type
+    if team_games["date"].dtype not in (pl.Date, pl.Datetime):
+        # nflreadpy often emits ISO strings; parse to Date (non-strict to allow blanks)
+        team_games = team_games.with_columns(
+            pl.col("date").str.strptime(pl.Date, strict=False)
+        )
 
+    # Sort chronologically within team
     team_games = team_games.sort(["team", "date", "week"])
 
     # Add raw outcomes
@@ -52,9 +55,10 @@ def build_team_history(sched: pl.DataFrame) -> pl.DataFrame:
         (pl.col("pts_for") > pl.col("pts_against")).cast(pl.Int8).alias("win")
     ])
 
-    # Compute rest days per team (days since previous game)
+    # ✅ FIX: Compute rest days (duration in days) between games per team
+    # diff() -> Duration; use .dt.duration_days() to extract integer days
     team_games = team_games.with_columns(
-        (pl.col("date").diff().dt.days()).over("team").alias("rest_days")
+        pl.col("date").diff().dt.duration_days().over("team").alias("rest_days")
     )
 
     # Rolling features (exclude current game: shift(1))
@@ -99,7 +103,7 @@ def main():
 
     df = pl.concat([pl.read_csv(p) for p in sched_paths], how="vertical_relaxed")
 
-    # Ensure expected base columns exist (some leagues weeks/dates can be null for future)
+    # Ensure expected base columns exist
     keep_base = [c for c in [
         "season","week","game_id","gameday",
         "home_team","away_team","home_score","away_score",
@@ -166,7 +170,6 @@ def main():
 
     # Final engineered columns compatible with your trainer
     feats = feats.with_columns([
-        # Already in your minimal features; keep them for continuity
         (pl.col("home_score") - pl.col("away_score")).alias("final_margin"),
         pl.col("spread_line").alias("implied_margin"),
         pl.col("total_line").alias("implied_total"),
