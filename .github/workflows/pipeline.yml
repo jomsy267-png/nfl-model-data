@@ -659,18 +659,18 @@ jobs:
           retention-days: 30
 
   discord_push:
-    name: Post daily report to Discord
+    name: Post daily report to Discord (zipped bundle)
     needs: [predict_and_report, backtest]
     runs-on: ubuntu-latest
     steps:
       - name: Print current times (UTC & Edmonton)
         run: |
           echo "UTC:       $(date -u)"
-          TZ=America/Edmonton date +"Edmonton: %Y-%m-%d %H:%M:%S %Z"
+          TZ=America/Edmonton date +"%Y-%m-%d %H:%M:%S %Z"
 
       - uses: actions/checkout@v4
 
-      # Pull artifacts we want to send
+      # Pull artifacts we want to zip & send
       - name: Download predictions artifact
         uses: actions/download-artifact@v4
         with:
@@ -681,6 +681,34 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: backtest
+          path: models
+        continue-on-error: true
+
+      - name: Download model artifacts (metrics)
+        uses: actions/download-artifact@v4
+        with:
+          name: model_artifacts
+          path: models
+        continue-on-error: true
+
+      - name: Download calibrator (optional)
+        uses: actions/download-artifact@v4
+        with:
+          name: calibrator
+          path: models
+        continue-on-error: true
+
+      - name: Download blended artifacts (optional)
+        uses: actions/download-artifact@v4
+        with:
+          name: blended_artifacts
+          path: models
+        continue-on-error: true
+
+      - name: Download xgb artifacts (optional)
+        uses: actions/download-artifact@v4
+        with:
+          name: xgb_artifacts
           path: models
         continue-on-error: true
 
@@ -700,29 +728,74 @@ jobs:
             echo
             if [ -f models/report.md ]; then
               echo "**Model Report (preview):**"
-              sed -n '1,25p' models/report.md
+              sed -n '1,20p' models/report.md
               echo
             fi
             if [ -f models/backtest_report.md ]; then
               echo "**Backtest (preview):**"
-              sed -n '1,20p' models/backtest_report.md
+              sed -n '1,15p' models/backtest_report.md
               echo
             fi
-            echo "_Full files attached below._"
+            echo "_Attached: zipped bundle with reports, predictions, and metrics._"
           } > discord_message.txt
 
           # Trim to Discord hard limit
           head -c 1900 discord_message.txt > discord_message_trimmed.txt
 
-      - name: Build payload.json (no Python)
+          # Build payload JSON as a STRING (not a file upload)
+          CONTENT=$(jq -Rs '.' < discord_message_trimmed.txt)
+          echo "{\"content\": ${CONTENT}}" > payload.json
+          echo "payload.json built"
+
+      - name: Create ZIP bundle
+        id: zipstep
         shell: bash
         run: |
-          # Create {"content": "<trimmed message>"} using jq
-          jq -Rs '{content: .}' < discord_message_trimmed.txt > payload.json
-          echo "payload.json built:"
-          head -c 200 payload.json && echo
+          set -euo pipefail
+          mkdir -p out
 
-      - name: Send to Discord (message + attachments)
+          add_if_exists () {
+            if [ -f "$1" ]; then
+              cp -f "$1" "out/$(basename "$1")"
+              echo "Added: $1"
+            else
+              echo "Missing (skipped): $1"
+            fi
+          }
+
+          # Core deliverables
+          add_if_exists models/report.md
+          add_if_exists models/predictions.csv
+          add_if_exists models/backtest_report.md
+
+          # Useful metrics/config if present
+          add_if_exists models/training_metrics.json
+          add_if_exists models/backtest_metrics.json
+          add_if_exists models/blend_metrics.json
+          add_if_exists models/xgb_metrics.json
+          add_if_exists models/calibrator_isotonic.json
+
+          # If nothing collected, include a placeholder
+          if [ -z "$(ls -A out || true)" ]; then
+            echo "No output files found to include." > out/README.txt
+          fi
+
+          BUNDLE="NFL_Bundle_${GITHUB_REPOSITORY//\//_}_run${GITHUB_RUN_NUMBER}.zip"
+          (cd out && zip -q -r "../${BUNDLE}" .)
+          echo "bundle=${BUNDLE}" >> "$GITHUB_OUTPUT"
+          echo "Created bundle: ${BUNDLE}"
+
+      - name: Show bundle contents (debug)
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUNDLE="${{ steps.zipstep.outputs.bundle }}"
+          echo "--- models dir ---"
+          ls -la models || true
+          echo "--- zip listing ---"
+          unzip -l "$BUNDLE" || (echo "unzip not available; printing zip file name only"; ls -la "$BUNDLE")
+
+      - name: Send to Discord (message + ZIP only)
         shell: bash
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
@@ -734,25 +807,20 @@ jobs:
             exit 1
           fi
 
-          files=()
-          i=1
-          attach_if_exists () {
-            if [ -f "$1" ]; then
-              files+=(-F "file${i}=@$1")
-              i=$((i+1))
-            fi
-          }
-          attach_if_exists "models/report.md"
-          attach_if_exists "models/predictions.csv"
-          attach_if_exists "models/backtest_report.md"
+          BUNDLE="${{ steps.zipstep.outputs.bundle }}"
+          if [ ! -f "$BUNDLE" ]; then
+            echo "ERROR: Missing bundle zip: $BUNDLE"
+            exit 1
+          fi
 
           # Send via webhook (multipart/form-data)
+          # Use --form-string so payload_json is treated as a string param (NOT a file)
           curl -sS -X POST "$WEBHOOK" \
-            -H "Content-Type: multipart/form-data" \
-            -F "payload_json=@payload.json;type=application/json" \
-            "${files[@]}" >/dev/null
+            --form-string "payload_json=$(cat payload.json)" \
+            -F "file1=@${BUNDLE}" > /dev/null
 
-          echo "Sent Discord message with $((i-1)) attachments."
+          echo "Sent Discord message with bundle: ${BUNDLE}"
+
 
 
 
