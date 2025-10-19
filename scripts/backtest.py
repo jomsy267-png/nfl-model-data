@@ -131,24 +131,27 @@ def main():
         "auc": auc_roc(probs, labels),
     }
 
-    # By-season aggregates
+    # By-season aggregates (Polars 0.20+ friendly)
     by_season = (
         out
         .with_columns(pl.col("p_cal").fill_null(pl.col("p_raw")).alias("p_use"))
         .group_by("season")
         .agg([
-            pl.count().alias("n"),
-            pl.mean((pl.col("p_use") - pl.col("home_win")).pow(2)).alias("brier"),
-            pl.mean(pl.when(pl.col("home_win")==1).then(-(pl.col("p_use")+1e-12).log())
-                    .otherwise(-((1-pl.col("p_use")+1e-12).log()))).alias("logloss"),
-            pl.mean((pl.col("p_use")>=0.5).cast(pl.Int8) == pl.col("home_win")).alias("accuracy")
+            pl.len().alias("n"),
+            ((pl.col("p_use") - pl.col("home_win"))**2).mean().alias("brier"),
+            pl.when(pl.col("home_win") == 1)
+              .then(-(pl.col("p_use") + pl.lit(1e-12)).log())
+              .otherwise(-((pl.lit(1.0) - pl.col("p_use") + pl.lit(1e-12)).log()))
+              .mean()
+              .alias("logloss"),
+            ((pl.col("p_use") >= 0.5).cast(pl.Int8) == pl.col("home_win")).cast(pl.Float64).mean().alias("accuracy"),
         ])
         .sort("season")
     )
     by_season_path = os.path.join(args.out_dir, "backtest_by_season.csv")
     by_season.write_csv(by_season_path)
 
-    # By-week aggregates
+    # By-week aggregates (if season/week present)
     by_week_cols = [c for c in ["season","week"] if c in out.columns]
     if by_week_cols:
         by_week = (
@@ -156,11 +159,14 @@ def main():
             .with_columns(pl.col("p_cal").fill_null(pl.col("p_raw")).alias("p_use"))
             .group_by(by_week_cols)
             .agg([
-                pl.count().alias("n"),
-                pl.mean((pl.col("p_use") - pl.col("home_win")).pow(2)).alias("brier"),
-                pl.mean(pl.when(pl.col("home_win")==1).then(-(pl.col("p_use")+1e-12).log())
-                        .otherwise(-((1-pl.col("p_use")+1e-12).log()))).alias("logloss"),
-                pl.mean((pl.col("p_use")>=0.5).cast(pl.Int8) == pl.col("home_win")).alias("accuracy")
+                pl.len().alias("n"),
+                ((pl.col("p_use") - pl.col("home_win"))**2).mean().alias("brier"),
+                pl.when(pl.col("home_win") == 1)
+                  .then(-(pl.col("p_use") + pl.lit(1e-12)).log())
+                  .otherwise(-((pl.lit(1.0) - pl.col("p_use") + pl.lit(1e-12)).log()))
+                  .mean()
+                  .alias("logloss"),
+                ((pl.col("p_use") >= 0.5).cast(pl.Int8) == pl.col("home_win")).cast(pl.Float64).mean().alias("accuracy"),
             ])
             .sort(by_week_cols)
         )
