@@ -3,16 +3,17 @@ name: nfl-pipeline
 on:
   workflow_dispatch:
   schedule:
-    # Edmonton 10:00 daily (DST aware via two cron lines)
-    - cron: "0 16 * 3-10 *"   # Mar–Oct ~ MDT (UTC-6)
-    - cron: "0 17 * 11,12,1,2 *" # Nov–Feb ~ MST (UTC-7)
+    # Run daily 10:00 AM America/Edmonton
+    # (Two cron lines approximate DST shift)
+    - cron: "0 16 * 3-10 *"      # Mar–Oct (UTC-6)
+    - cron: "0 17 * 11,12,1,2 *" # Nov–Feb (UTC-7)
 
 permissions:
   contents: write
 
 jobs:
   fetch_schedules:
-    name: Fetch schedules (scores + closing lines) with fallback
+    name: Fetch schedules from nfldata (force 2025; split)
     runs-on: ubuntu-latest
     steps:
       - name: Print current times (UTC & Edmonton)
@@ -21,59 +22,58 @@ jobs:
           TZ=America/Edmonton date +"%Y-%m-%d %H:%M:%S %Z"
 
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
 
-      - name: Install deps (both loaders)
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install polars nflreadpy nfl_data_py pandas
+          pip install nflreadpy polars pandas
 
-      - name: Download schedules (try nflreadpy, fallback to nfl_data_py)
+      - name: Download schedules (nfldata via nflreadpy; season 2025)
         run: |
           python - << 'PY'
-          import os, sys, datetime
+          import os, sys
           import polars as pl
+
+          YEAR = 2025
           os.makedirs("data/external", exist_ok=True)
 
-          def write_and_split(df_pl: pl.DataFrame):
-              df_pl.write_csv("data/external/schedules_all.csv")
-              if "season" not in df_pl.columns:
-                  print("No 'season' column; wrote schedules_all.csv only.", file=sys.stderr)
-                  return
-              for season in sorted(df_pl.get_column("season").unique().to_list()):
-                  sdf = df_pl.filter(pl.col("season") == season)
-                  out = f"data/external/schedules_{season}.csv"
-                  sdf.write_csv(out)
-                  print(f"Wrote {out} ({sdf.height} rows)")
+          def write(df):
+            # normalize & save both "all" and the year slice
+            if "season" in df.columns:
+              df = df.with_columns(pl.col("season").cast(pl.Int32, strict=False))
+            df.write_csv("data/external/schedules_all.csv")
+            if "season" in df.columns:
+              dfy = df.filter(pl.col("season")==YEAR)
+            else:
+              dfy = df
+            dfy.write_csv(f"data/external/schedules_{YEAR}.csv")
+            print(f"Wrote schedules_all.csv ({df.height} rows)")
+            print(f"Wrote schedules_{YEAR}.csv ({dfy.height} rows)")
 
-          # 1) Try nflreadpy
           try:
-              import nflreadpy as nfl
-              print("Trying nflreadpy.load_schedules() ...")
-              df = nfl.load_schedules()
-              try:
-                  import pandas as pd
-                  df_pl = pl.from_pandas(df) if isinstance(df, pd.DataFrame) else df
-              except Exception:
-                  df_pl = pl.DataFrame(df)
-              write_and_split(df_pl)
+            print("[primary] nflreadpy.load_schedules(seasons=[2025]) …")
+            import nflreadpy as nfl
+            df_any = nfl.load_schedules(seasons=[YEAR])   # pulls from nfldata/nflverse pipelines
+            try:
+              import pandas as pd
+              df_pl = pl.from_pandas(df_any) if hasattr(df_any, "to_dict") else df_any
+            except Exception:
+              df_pl = pl.DataFrame(df_any)
+            if "season" in df_pl.columns:
+              df_pl = df_pl.filter(pl.col("season")==YEAR)
+            if df_pl.height == 0:
+              raise RuntimeError("no rows for 2025")
+            write(df_pl)
           except Exception as e:
-              print(f"[WARN] nflreadpy failed: {e}", file=sys.stderr)
-              print("Falling back to nfl_data_py.import_schedules(...)")
-              try:
-                  import nfl_data_py as ndp, pandas as pd
-                  this_year = datetime.datetime.utcnow().year
-                  years = list(range(1999, this_year + 1))
-                  df_pd = ndp.import_schedules(years)
-                  df_pl = pl.from_pandas(df_pd)
-                  write_and_split(df_pl)
-              except Exception as e2:
-                  print(f"[ERROR] nfl_data_py fallback failed: {e2}", file=sys.stderr)
-                  sys.exit(2)
+            print(f"[ERROR] schedules load failed: {e}", file=sys.stderr)
+            sys.exit(2)
           PY
 
       - name: Upload schedules artifact
@@ -82,7 +82,7 @@ jobs:
           name: schedules_split
           path: |
             data/external/schedules_all.csv
-            data/external/schedules_*.csv
+            data/external/schedules_2025.csv
           retention-days: 7
 
   fetch_pbp:
@@ -95,11 +95,13 @@ jobs:
           TZ=America/Edmonton date +"%Y-%m-%d %H:%M:%S %Z"
 
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
 
       - name: Install deps
         run: |
@@ -153,7 +155,8 @@ jobs:
 
       - name: Set up Python
         uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
 
       - name: Install deps
         run: |
@@ -211,7 +214,8 @@ jobs:
 
       - name: Set up Python
         uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
 
       - name: Install deps
         run: |
@@ -312,7 +316,8 @@ jobs:
 
       - name: Set up Python
         uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
 
       - name: Install deps
         run: |
@@ -363,7 +368,8 @@ jobs:
 
       - name: Set up Python
         uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
 
       - name: Install deps
         run: |
@@ -419,7 +425,8 @@ jobs:
 
       - name: Set up Python
         uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
 
       - name: Install deps
         run: |
@@ -491,7 +498,8 @@ jobs:
 
       - name: Set up Python
         uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
 
       - name: Install deps
         run: |
