@@ -1,7 +1,4 @@
 name: NFL Pipeline (fetch → features → train → publish)
-python scripts/build_features.py --pbp_dir data/raw/nflverse__nflfastR-play-by-play-data \
---schedules_glob "data/external/schedules_*.csv" \
---out data/processed/team_week_features.csv
 - name: Smoke test features
 run: python scripts/feature_smoke_test.py data/processed/team_week_features.csv
 
