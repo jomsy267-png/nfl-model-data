@@ -132,8 +132,7 @@ jobs:
 
       - name: Set up Python
         uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        with: { python-version: "3.11" }
 
       - name: Install deps
         run: |
@@ -163,7 +162,7 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      # Download the features artifact into ./team_features/
+      # Download features artifact into ./team_features/
       - name: Download features artifact
         uses: actions/download-artifact@v4
         with:
@@ -180,14 +179,12 @@ jobs:
           echo "--- data/processed (pre-existing, if any) ---"
           ls -laR data/processed || true
 
-      # Robustly locate team_week_features.csv regardless of how the artifact was zipped
+      # Robustly locate team_week_features.csv regardless of artifact layout
       - name: Move features into expected path
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p data/processed models
-
-          # Try common locations inside the artifact
           if [ -f team_features/team_week_features.csv ]; then
             SRC="team_features/team_week_features.csv"
           elif [ -f team_features/data/processed/team_week_features.csv ]; then
@@ -201,14 +198,12 @@ jobs:
             ls -laR team_features || true
             exit 2
           fi
-
           cp "$SRC" data/processed/team_week_features.csv
           echo "Copied $SRC -> data/processed/team_week_features.csv"
 
       - name: Set up Python
         uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        with: { python-version: "3.11" }
 
       - name: Install deps
         run: |
@@ -265,15 +260,16 @@ jobs:
           name: team_features
           path: data/processed
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
+      # STEP 2 (Install deps) — choose ONE option (A recommended)
+      - name: Install deps (lean)
         run: |
           python -m pip install --upgrade pip
           pip install polars scikit-learn
+
+      # - name: Install deps (expanded)
+      #   run: |
+      #     python -m pip install --upgrade pip
+      #     pip install numpy scipy scikit-learn polars
 
       - name: Fit isotonic calibrator
         run: |
@@ -296,7 +292,6 @@ jobs:
           path: models/calibrator_isotonic.json
           if-no-files-found: warn
           retention-days: 30
-
 
   predict_and_report:
     name: Score upcoming games + report (pure Polars, null-safe, calibrated if available)
@@ -331,8 +326,7 @@ jobs:
 
       - name: Set up Python
         uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        with: { python-version: "3.11" }
 
       - name: Install deps
         run: |
@@ -391,7 +385,7 @@ jobs:
               f.write("# NFL Model Report\n\n_Model has no usable features; predictions skipped._\n")
             sys.exit(0)
 
-          # Ensure features exist & are float, fill null
+          # Ensure features exist & are float, fill nulls with 0.0
           for c in feats:
             if c not in df.columns:
               df = df.with_columns(pl.lit(0.0).alias(c))
@@ -406,9 +400,6 @@ jobs:
           # Apply isotonic calibration if available
           if calibrator:
             xs, ys = calibrator
-            # Build calibrated prob column by vectorized lookup
-            # For each p, find index i = bisect_right(xs, p)-1, then interpolate to ys[i]/ys[i+1]
-            # Implement via apply (small number of rows, fine).
             def calibrate_scalar(p):
               i = bisect.bisect_right(xs, float(p)) - 1
               if i < 0:
@@ -421,9 +412,7 @@ jobs:
                 return float(y0)
               t = (float(p) - x0) / (x1 - x0)
               return float(y0 + t * (y1 - y0))
-
-            p_cal = pl.col("p_raw").map_elements(calibrate_scalar).alias("home_win_prob")
-            out_prob = p_cal
+            out_prob = pl.col("p_raw").map_elements(calibrate_scalar).alias("home_win_prob")
           else:
             out_prob = p_raw.alias("home_win_prob")
 
@@ -460,9 +449,9 @@ jobs:
             lines += ["", "| season | week | game_id | home_team | away_team | home_win_prob |",
                            "|---:|---:|---|---|---|---:|"]
             for r in top.iter_rows(named=True):
-              lines.append(f\"| {r.get('season','')} | {r.get('week','')} | {r.get('game_id','')} | {r.get('home_team','')} | {r.get('away_team','')} | {fmt(r.get('home_win_prob',0.0),3)} |\")
+              lines.append(f"| {r.get('season','')} | {r.get('week','')} | {r.get('game_id','')} | {r.get('home_team','')} | {r.get('away_team','')} | {fmt(r.get('home_win_prob',0.0),3)} |")
           with open("models/report.md","w") as f:
-            f.write("\\n".join(lines))
+            f.write("\n".join(lines))
           PY
 
       - name: Upload predictions/report
@@ -473,7 +462,3 @@ jobs:
             models/predictions.csv
             models/report.md
           retention-days: 30
-
-
-
-
