@@ -527,3 +527,104 @@ jobs:
             models/predictions.csv
             models/report.md
           retention-days: 30
+
+  discord_push:
+    name: Post daily report to Discord
+    needs: [predict_and_report, backtest]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print current times (UTC & Edmonton)
+        run: |
+          echo "UTC:       $(date -u)"
+          TZ=America/Edmonton date +"Edmonton: %Y-%m-%d %H:%M:%S %Z"
+
+      - uses: actions/checkout@v4
+
+      # Pull artifacts we want to send
+      - name: Download predictions artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: predictions
+          path: models
+
+      - name: Download backtest artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: backtest
+          path: models
+
+      - name: Build short Discord message (<= 2000 chars)
+        id: msg
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPO="${GITHUB_REPOSITORY}"
+          RUN="${GITHUB_RUN_NUMBER}"
+          DATE_UTC="$(date -u '+%Y-%m-%d %H:%M UTC')"
+
+          # Compose a compact text body
+          {
+            echo "**NFL Daily — ${REPO} #${RUN}**"
+            echo "_${DATE_UTC}_"
+            echo
+            if [ -f models/report.md ]; then
+              echo "**Model Report (preview):**"
+              sed -n '1,25p' models/report.md
+              echo
+            fi
+            if [ -f models/backtest_report.md ]; then
+              echo "**Backtest (preview):**"
+              sed -n '1,20p' models/backtest_report.md
+              echo
+            fi
+            echo "_Full files attached below._"
+          } > discord_message.txt
+
+          # Truncate to Discord hard limit (2000 chars) just in case
+          head -c 1900 discord_message.txt > discord_message_trimmed.txt
+          echo "path=discord_message_trimmed.txt" >> "$GITHUB_OUTPUT"
+
+      # Post message + attach files via webhook (multipart form-data)
+      - name: Send to Discord (message + attachments)
+        shell: bash
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+
+          # Ensure at least a message
+          test -s discord_message_trimmed.txt || echo "NFL Daily report" > discord_message_trimmed.txt
+
+          # Build a minimal JSON payload (content only)
+          printf '{"content": %s}\n' "$(jq -Rs . < discord_message_trimmed.txt)" > payload.json || {
+            # Fallback if jq isn't available (should be, but just in case)
+            python - <<'PY'
+import json,sys
+txt=open('discord_message_trimmed.txt','r',encoding='utf-8').read()
+open('payload.json','w',encoding='utf-8').write(json.dumps({"content":txt}))
+PY
+          }
+
+          # Prepare attachment flags (Discord webhooks allow multiple files)
+          files=()
+          i=1
+          attach_if_exists () {
+            if [ -f "$1" ]; then
+              files+=(-F "file${i}=@$1")
+              i=$((i+1))
+            fi
+          }
+          attach_if_exists "models/report.md"
+          attach_if_exists "models/predictions.csv"
+          attach_if_exists "models/backtest_report.md"
+
+          # Send via webhook
+          curl -sS -X POST "$WEBHOOK" \
+            -H "Content-Type: multipart/form-data" \
+            -F "payload_json=@payload.json" \
+            "${files[@]:-}" \
+            | sed -e 's/.*//'
+
+          echo "Sent Discord message with $((i-1)) attachments."
+
