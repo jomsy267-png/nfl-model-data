@@ -107,7 +107,7 @@ jobs:
           retention-days: 7
 
   build_features:
-    name: Build minimal team_week_features.csv
+    name: Build expanded team_week_features.csv
     needs: [fetch_schedules, fetch_pbp]
     runs-on: ubuntu-latest
     steps:
@@ -132,41 +132,17 @@ jobs:
 
       - name: Set up Python
         uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install polars
 
-      - name: Build minimal features (Polars)
+      - name: Build expanded features via script
         run: |
-          python - << 'PY'
-          import glob, os, polars as pl
-          os.makedirs("data/processed", exist_ok=True)
-
-          sched_paths = sorted(glob.glob("data/external/schedules_*.csv"))
-          if not sched_paths:
-            raise SystemExit("No schedules_*.csv found")
-          df = pl.concat([pl.read_csv(p) for p in sched_paths], how="vertical_relaxed")
-
-          keep_cols = [c for c in [
-            "season","week","game_id","gameday","home_team","away_team",
-            "spread_line","total_line","home_score","away_score"
-          ] if c in df.columns]
-          feats = df.select(keep_cols)
-
-          if set(["home_score","away_score"]).issubset(feats.columns):
-            feats = feats.with_columns((pl.col("home_score") - pl.col("away_score")).alias("final_margin"))
-          if "spread_line" in feats.columns:
-            feats = feats.with_columns(pl.col("spread_line").alias("implied_margin"))
-          if "total_line" in feats.columns:
-            feats = feats.with_columns(pl.col("total_line").alias("implied_total"))
-
-          out = "data/processed/team_week_features.csv"
-          feats.write_csv(out)
-          print(f"Wrote {out} ({feats.height} rows, {len(feats.columns)} cols)")
-          PY
+          python scripts/build_features.py
 
       - name: Upload features artifact
         uses: actions/upload-artifact@v4
