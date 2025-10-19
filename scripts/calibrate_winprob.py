@@ -2,9 +2,13 @@
 # Fit an isotonic calibration curve on historical rows, save as JSON knots.
 # Deps: polars, scikit-learn
 
-import argparse, json, os
+import argparse
+import json
+import os
 import polars as pl
 from sklearn.isotonic import IsotonicRegression
+
+MIN_POINTS = 200  # minimum labeled rows to fit reliably
 
 def main():
     ap = argparse.ArgumentParser()
@@ -14,25 +18,41 @@ def main():
     args = ap.parse_args()
 
     if not os.path.exists(args.features_csv):
-        raise SystemExit(f"Missing features CSV: {args.features_csv}")
-    if not os.path.exists(args.model_json):
-        raise SystemExit(f"Missing model JSON: {args.model_json}")
-
-    df = pl.read_csv(args.features_csv)
-    # Keep labeled rows only
-    has_scores = set(["home_score","away_score"]).issubset(df.columns)
-    if not has_scores:
-        # Nothing to calibrate
         with open(args.out_json, "w") as f:
-            json.dump({"note": "no_scores_to_calibrate"}, f, indent=2)
-        print("No scores in features; wrote a pass-through calibrator note.")
+            json.dump({"note": "missing_features_csv", "path": args.features_csv}, f, indent=2)
         return
 
-    df = df.with_columns((pl.col("home_score") > pl.col("away_score")).cast(pl.Int8).alias("home_win"))
+    if not os.path.exists(args.model_json):
+        with open(args.out_json, "w") as f:
+            json.dump({"note": "missing_model_json", "path": args.model_json}, f, indent=2)
+        return
 
-    # Load model
+    df = pl.read_csv(args.features_csv)
+
+    # Need historical games with final scores
+    if not {"home_score","away_score"}.issubset(df.columns):
+        with open(args.out_json, "w") as f:
+            json.dump({"note": "no_score_columns"}, f, indent=2)
+        return
+
+    df = df.with_columns(
+        (pl.col("home_score").is_not_null() & pl.col("away_score").is_not_null()).alias("_has_scores")
+    ).filter(pl.col("_has_scores")).drop("_has_scores")
+
+    if df.height < MIN_POINTS:
+        with open(args.out_json, "w") as f:
+            json.dump({"note": "too_few_scored_games", "n": int(df.height)}, f, indent=2)
+        return
+
+    # Target
+    df = df.with_columns(
+        (pl.col("home_score") > pl.col("away_score")).cast(pl.Int8).alias("home_win")
+    )
+
+    # Load model and prepare features
     with open(args.model_json) as f:
         model = json.load(f)
+
     feats = model.get("features", [])
     coef = model.get("coef", [])
     intercept = float(model.get("intercept", 0.0))
@@ -40,36 +60,36 @@ def main():
     if not feats or not coef or len(feats) != len(coef):
         with open(args.out_json, "w") as f:
             json.dump({"note": "model_has_no_usable_features"}, f, indent=2)
-        print("Model has no usable features; wrote note.")
         return
 
-    # Ensure feature columns exist and are float, fill nulls with 0.0
+    # Ensure feature columns exist and are float; fill nulls with 0.0
     for c in feats:
         if c not in df.columns:
             df = df.with_columns(pl.lit(0.0).alias(c))
     df = df.with_columns([pl.col(c).cast(pl.Float64).fill_null(0.0) for c in feats])
 
-    # Raw prob via logistic: 1 / (1 + exp(-z))
+    # Build raw probability via logistic: p_raw = 1/(1 + exp(-(b0 + sum(w*x))))
     logit = pl.lit(intercept)
     for c, w in zip(feats, coef):
         logit = logit + pl.col(c) * float(w)
-    prob = (1 / (1 + (-logit).exp())).alias("p_raw")
+    df = df.with_columns(((1 / (1 + (-logit).exp()))).alias("p_raw"))
 
-    scored = df.select(["home_win"] + feats).with_columns(prob)
-    scored_np = scored.select(["p_raw","home_win"]).to_numpy()
-    if scored_np.shape[0] < 200:
-        # Too few points to fit isotonic reliably
+    # Drop any residual nulls in target / p_raw (defensive)
+    df = df.filter(pl.col("home_win").is_not_null() & pl.col("p_raw").is_not_null())
+
+    n = df.height
+    if n < MIN_POINTS:
         with open(args.out_json, "w") as f:
-            json.dump({"note": "too_few_points", "n": int(scored_np.shape[0])}, f, indent=2)
-        print(f"Too few points ({scored_np.shape[0]}) for isotonic; wrote note.")
+            json.dump({"note": "too_few_points_after_clean", "n": int(n)}, f, indent=2)
         return
 
-    p_raw = scored_np[:,0]
-    y = scored_np[:,1]
+    # Prepare Python lists (avoids hard dependency on NumPy here)
+    p_raw = df.get_column("p_raw").to_list()
+    y = df.get_column("home_win").to_list()
 
     # Fit isotonic mapping
     iso = IsotonicRegression(out_of_bounds="clip")
-    p_cal = iso.fit_transform(p_raw, y)
+    p_cal = iso.fit_transform(p_raw, y)  # fit + transform (transform output unused beyond fit)
 
     # Save knots (x_thresholds and y_values)
     calibrator = {
@@ -77,11 +97,13 @@ def main():
         "x_thresholds": iso.X_thresholds_.tolist(),
         "y_values": iso.y_thresholds_.tolist(),
         "n_points": int(len(iso.X_thresholds_)),
+        "train_samples": int(n),
     }
     os.makedirs(os.path.dirname(args.out_json), exist_ok=True)
     with open(args.out_json, "w") as f:
         json.dump(calibrator, f, indent=2)
-    print(f"Wrote {args.out_json} with {calibrator['n_points']} knots.")
+
+    print(f"Wrote {args.out_json} with {calibrator['n_points']} knots (N={n}).")
 
 if __name__ == "__main__":
     main()
