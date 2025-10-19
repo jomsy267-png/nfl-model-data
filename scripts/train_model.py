@@ -33,10 +33,12 @@ def main():
         return
 
     # Feature candidates (keep it tiny & robust)
-    feature_candidates = [c for c in ["implied_margin","implied_total"] if c in df.columns]
-    if not feature_candidates:
-        # Fall back to spread/total names if present
-        feature_candidates = [c for c in ["spread_line","total_line"] if c in df.columns]
+   feature_candidates = [c for c in [
+    "implied_margin","implied_total",
+    "h_roll3_margin","a_roll3_margin",
+    "h_roll3_winpct","a_roll3_winpct",
+    "h_rest_days","a_rest_days"
+] if c in df.columns
 
     # Training rows: must have target and feature columns non-null
     use_cols = feature_candidates + ["home_win"]
