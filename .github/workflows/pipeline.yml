@@ -2,19 +2,20 @@ name: nfl-pipeline
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   fetch_schedules:
+    name: Fetch schedules (scores + closing lines)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
 
       - name: Set up Python
         uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        with: { python-version: "3.11" }
 
       - name: Install deps
         run: |
@@ -29,11 +30,11 @@ jobs:
           import nflreadpy as nfl  # returns Polars DataFrames
           os.makedirs("data/external", exist_ok=True)
 
-          df = nfl.load_schedules()  # Polars DataFrame
+          df = nfl.load_schedules()  # Polars DataFrame of all seasons
           df.write_csv("data/external/schedules_all.csv")
 
           seasons = df.get_column("season").unique().to_list()
-          for season in seasons:
+          for season in sorted(seasons):
             sdf = df.filter(pl.col("season") == season)
             out = f"data/external/schedules_{season}.csv"
             sdf.write_csv(out)
@@ -48,3 +49,146 @@ jobs:
             data/external/schedules_all.csv
             data/external/schedules_*.csv
           retention-days: 7
+
+  fetch_pbp:
+    name: Fetch play-by-play (last 4 seasons)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install nflreadpy polars
+
+      - name: Download PBP via nflreadpy (Polars)
+        run: |
+          python - << 'PY'
+          import os, polars as pl, nflreadpy as nfl
+          os.makedirs("data/raw/nflverse__nflfastR-play-by-play-data", exist_ok=True)
+
+          seasons = [2022, 2023, 2024, 2025]
+          df = nfl.load_pbp(seasons=seasons)  # Polars DF
+          for s in seasons:
+            sdf = df.filter(pl.col("season") == s)
+            out = f"data/raw/nflverse__nflfastR-play-by-play-data/play_by_play_{s}.csv"
+            sdf.write_csv(out)
+            print(f"Wrote {out} ({sdf.height} rows)")
+          PY
+
+      - name: Upload PBP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pbp_raw
+          path: data/raw/nflverse__nflfastR-play-by-play-data/play_by_play_*.csv
+          retention-days: 7
+
+  build_features:
+    name: Build minimal team_week_features.csv
+    needs: [fetch_schedules, fetch_pbp]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: schedules_split
+          path: data/external
+      - uses: actions/download-artifact@v4
+        with:
+          name: pbp_raw
+          path: data/raw/nflverse__nflfastR-play-by-play-data
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install polars
+
+      - name: Build minimal features (Polars)
+        run: |
+          python - << 'PY'
+          import glob, os, polars as pl
+          os.makedirs("data/processed", exist_ok=True)
+
+          # Join all schedules files
+          sched_paths = sorted(glob.glob("data/external/schedules_*.csv"))
+          if not sched_paths:
+            raise SystemExit("No schedules_*.csv found")
+          df = pl.concat([pl.read_csv(p) for p in sched_paths], how="vertical_relaxed")
+
+          # Keep only columns that exist
+          keep_cols = [c for c in [
+            "season","week","game_id","gameday","home_team","away_team",
+            "spread_line","total_line","home_score","away_score"
+          ] if c in df.columns]
+          feats = df.select(keep_cols)
+
+          # Lightweight engineered cols
+          if set(["home_score","away_score"]).issubset(feats.columns):
+            feats = feats.with_columns((pl.col("home_score") - pl.col("away_score")).alias("final_margin"))
+          if "spread_line" in feats.columns:
+            feats = feats.with_columns(pl.col("spread_line").alias("implied_margin"))
+          if "total_line" in feats.columns:
+            feats = feats.with_columns(pl.col("total_line").alias("implied_total"))
+
+          out = "data/processed/team_week_features.csv"
+          feats.write_csv(out)
+          print(f"Wrote {out} ({feats.height} rows, {len(feats.columns)} cols)")
+          PY
+
+      - name: Upload features artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: team_features
+          path: data/processed/team_week_features.csv
+          retention-days: 7
+
+  train:
+    name: Train toy model (logistic regression)
+    needs: [build_features]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download features artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: team_features
+          path: data/processed
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install polars numpy scikit-learn
+
+      - name: Train model
+        run: |
+          python scripts/train_model.py \
+            --features data/processed/team_week_features.csv \
+            --out_model models/nfl_model.json \
+            --out_metrics models/training_metrics.json \
+            --out_latest_features models/latest_team_features.csv
+
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: model_artifacts
+          path: |
+            models/nfl_model.json
+            models/training_metrics.json
+            models/latest_team_features.csv
+          retention-days: 30
