@@ -1,10 +1,14 @@
 # scripts/train_model.py
-import argparse, json, os
+import argparse
+import json
+import os
+
 import polars as pl
 import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
 from sklearn.model_selection import train_test_split
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -20,11 +24,12 @@ def main():
     df = pl.read_csv(args.features)
 
     # Create target if scores exist
-    has_scores = set(["home_score","away_score"]).issubset(df.columns)
+    has_scores = set(["home_score", "away_score"]).issubset(df.columns)
     if has_scores:
-        df = df.with_columns((pl.col("home_score") > pl.col("away_score")).cast(pl.Int8).alias("home_win"))
+        df = df.with_columns(
+            (pl.col("home_score") > pl.col("away_score")).cast(pl.Int8).alias("home_win")
+        )
     else:
-        # No historical labels → nothing to train
         with open(args.out_metrics, "w") as f:
             json.dump({"note": "No scores present; cannot train"}, f, indent=2)
         # Still produce latest features (everything)
@@ -32,29 +37,49 @@ def main():
         print("No scores present; wrote latest features only.")
         return
 
-    # Feature candidates (keep it tiny & robust)
-   feature_candidates = [c for c in [
-    "implied_margin","implied_total",
-    "h_roll3_margin","a_roll3_margin",
-    "h_roll3_winpct","a_roll3_winpct",
-    "h_rest_days","a_rest_days"
-] if c in df.columns
+    # —— Feature selection ——
+    # Keep it tiny but include some of the new engineered columns if present.
+    feature_candidates = [
+        "implied_margin",
+        "implied_total",
+        "h_roll3_margin",
+        "a_roll3_margin",
+        "h_roll3_winpct",
+        "a_roll3_winpct",
+        "h_rest_days",
+        "a_rest_days",
+        # fallbacks if implied_* not present
+        "spread_line",
+        "total_line",
+    ]
+    feature_candidates = [c for c in feature_candidates if c in df.columns]
 
-    # Training rows: must have target and feature columns non-null
+    # Training rows must have target + non-null features
     use_cols = feature_candidates + ["home_win"]
     df_train = df.select([c for c in use_cols if c in df.columns]).drop_nulls()
 
     if df_train.height < 200 or len(feature_candidates) == 0:
-        # Not enough data to fit meaningfully—emit metrics/pass-through model
         with open(args.out_metrics, "w") as f:
-            json.dump({
-                "note": "Insufficient data or features to train",
-                "rows": int(df_train.height),
-                "features": feature_candidates
-            }, f, indent=2)
+            json.dump(
+                {
+                    "note": "Insufficient data or features to train",
+                    "rows": int(df_train.height),
+                    "features": feature_candidates,
+                },
+                f,
+                indent=2,
+            )
         # Latest features = games without scores (likely upcoming)
-        latest = df.filter(pl.any_horizontal([pl.col("home_score").is_null(), pl.col("away_score").is_null()]))
-        latest.select([c for c in df.columns if c != "home_win"]).write_csv(args.out_latest_features)
+        latest = df.filter(
+            pl.any_horizontal([pl.col("home_score").is_null(), pl.col("away_score").is_null()])
+        )
+        latest = latest.select(
+            [c for c in ["season", "week", "game_id", "home_team", "away_team",
+                         "implied_margin", "implied_total", "spread_line", "total_line"]
+             if c in latest.columns]
+        )
+        latest.write_csv(args.out_latest_features)
+
         with open(args.out_model, "w") as f:
             json.dump({"model": "passthrough", "features": feature_candidates}, f, indent=2)
         print("Wrote passthrough artifacts.")
@@ -75,33 +100,33 @@ def main():
 
     # Predictions
     prob_train = clf.predict_proba(X_train)[:, 1]
-    prob_test  = clf.predict_proba(X_test)[:, 1]
+    prob_test = clf.predict_proba(X_test)[:, 1]
 
-    # Metrics (guarded)
+    # Metrics
     metrics = {}
     try:
         metrics["train_logloss"] = float(log_loss(y_train, prob_train))
-        metrics["test_logloss"]  = float(log_loss(y_test, prob_test))
+        metrics["test_logloss"] = float(log_loss(y_test, prob_test))
     except Exception:
         pass
     try:
         metrics["train_auc"] = float(roc_auc_score(y_train, prob_train))
-        metrics["test_auc"]  = float(roc_auc_score(y_test, prob_test))
+        metrics["test_auc"] = float(roc_auc_score(y_test, prob_test))
     except Exception:
         pass
     try:
         metrics["train_acc"] = float(accuracy_score(y_train, (prob_train >= 0.5).astype(int)))
-        metrics["test_acc"]  = float(accuracy_score(y_test, (prob_test  >= 0.5).astype(int)))
+        metrics["test_acc"] = float(accuracy_score(y_test, (prob_test >= 0.5).astype(int)))
     except Exception:
         pass
 
-    # Save a JSON-serializable model (coef/intercept/features)
+    # Save a JSON-serializable model
     model_json = {
         "model_type": "logistic_regression",
         "features": feature_candidates,
         "coef": clf.coef_.ravel().tolist(),
         "intercept": float(clf.intercept_.ravel()[0]),
-        "classes_": [int(c) for c in clf.classes_.tolist()]
+        "classes_": [int(c) for c in clf.classes_.tolist()],
     }
     with open(args.out_model, "w") as f:
         json.dump(model_json, f, indent=2)
@@ -110,19 +135,33 @@ def main():
     with open(args.out_metrics, "w") as f:
         json.dump(metrics, f, indent=2)
 
-    # Latest features = rows that don't have scores yet (likely upcoming games)
+    # Latest features = rows without scores yet (upcoming games)
     if has_scores:
-        latest = df.filter(pl.any_horizontal([pl.col("home_score").is_null(), pl.col("away_score").is_null()]))
+        latest = df.filter(
+            pl.any_horizontal([pl.col("home_score").is_null(), pl.col("away_score").is_null()])
+        )
     else:
         latest = df
-    # Keep only needed columns for inference
-    keep_for_latest = [c for c in ["season","week","game_id","home_team","away_team","implied_margin","implied_total","spread_line","total_line"] if c in latest.columns]
+
+    keep_for_latest = [
+        "season",
+        "week",
+        "game_id",
+        "home_team",
+        "away_team",
+        "implied_margin",
+        "implied_total",
+        "spread_line",
+        "total_line",
+    ]
+    keep_for_latest = [c for c in keep_for_latest if c in latest.columns]
     if keep_for_latest:
         latest = latest.select(keep_for_latest)
     latest.write_csv(args.out_latest_features)
 
     print("Training complete.")
     print("Metrics:", json.dumps(metrics))
+
 
 if __name__ == "__main__":
     main()
