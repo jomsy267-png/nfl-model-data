@@ -1,8 +1,47 @@
 name: nfl-pipeline
 on:
   workflow_dispatch:
+
 jobs:
-  sanity:
+  fetch_schedules:
+    name: Fetch schedules (scores + closing lines)
     runs-on: ubuntu-latest
     steps:
-      - run: echo ok
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create folder
+        run: mkdir -p data/external
+
+      - name: Download schedules
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/nflverse/nflverse-data/releases/download/schedules"
+          for FN in schedules.csv.gz schedules.csv; do
+            URL="${BASE}/${FN}"
+            echo "Trying ${URL}"
+            if curl -fL --retry 5 --retry-delay 2 "$URL" -o "data/external/${FN}"; then
+              echo "Downloaded ${FN}"
+              break
+            fi
+          done
+          test -e data/external/schedules.csv.gz || test -e data/external/schedules.csv
+
+      - name: Split into yearly files
+        run: |
+          set -euo pipefail
+          cd data/external
+          if [ -f schedules.csv.gz ]; then
+            gzip -dc schedules.csv.gz > schedules.csv
+          fi
+          awk -F, 'NR==1{hdr=$0; next} {out=sprintf("schedules_%s.csv",$2); if(!(out in seen)){print hdr > out; seen[out]=1} print >> out}' schedules.csv
+          ls -l schedules_*.csv | head -n 10
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: schedules_split
+          path: data/external/schedules_*.csv
+          retention-days: 7
