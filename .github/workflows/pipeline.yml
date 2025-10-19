@@ -179,9 +179,11 @@ jobs:
           pip install polars numpy scikit-learn
 
       - name: Train model
+        shell: bash
         run: |
+          set -euo pipefail
           python scripts/train_model.py \
             --features data/processed/team_week_features.csv \
             --out_model models/nfl_model.json \
             --out_metrics models/training_metrics.json \
-            --out
+            --out_latest_features models/latest_team_features.csv
