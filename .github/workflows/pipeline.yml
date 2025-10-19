@@ -243,7 +243,7 @@ jobs:
 
 
   predict_and_report:
-    name: Score upcoming games + report
+    name: Score upcoming games + report (pure Polars, no NumPy)
     needs: [train]
     runs-on: ubuntu-latest
     steps:
@@ -276,22 +276,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install polars
 
-      - name: Predict using saved logistic model + make report (pure Polars)
+      - name: Predict using saved logistic model + make report (no numpy/pandas)
         run: |
           python - << 'PY'
           import json, math, os, sys, polars as pl
 
           # Load model
-          with open("models/nfl_model.json") as f:
-            model = json.load(f)
+          try:
+            with open("models/nfl_model.json") as f:
+              model = json.load(f)
+          except Exception as e:
+            print(f"Could not load model: {e}", file=sys.stderr)
+            os.makedirs("models", exist_ok=True)
+            with open("models/predictions.csv","w") as f: f.write("note\nno model available\n")
+            with open("models/report.md","w") as f: f.write("# NFL Model Report\n\n_No model available._\n")
+            sys.exit(0)
 
-          # Pick features file: prefer latest, else full features
+          # Choose features file (prefer latest; fallback to full features)
           features_path = "models/latest_team_features.csv"
           if not os.path.exists(features_path):
             features_path = "data/processed/team_week_features.csv"
           if not os.path.exists(features_path):
             print("No features available for prediction.", file=sys.stderr)
-            # write empty artifacts to keep step green
             os.makedirs("models", exist_ok=True)
             with open("models/predictions.csv","w") as f: f.write("note\nno features\n")
             with open("models/report.md","w") as f: f.write("# NFL Model Report\n\n_No features to score._\n")
@@ -300,40 +306,37 @@ jobs:
           df = pl.read_csv(features_path)
 
           feats = model.get("features", [])
-          if not feats:
+          coef = model.get("coef", [])
+          intercept = float(model.get("intercept", 0.0))
+
+          if not feats or not coef or len(feats) != len(coef):
             os.makedirs("models", exist_ok=True)
             with open("models/predictions.csv","w") as f:
-              f.write("note\nmodel has no features\n")
+              f.write("note\nmodel has no usable features\n")
             with open("models/report.md","w") as f:
-              f.write("# NFL Model Report\n\n_Model has no features; predictions skipped._\n")
+              f.write("# NFL Model Report\n\n_Model has no usable features; predictions skipped._\n")
             sys.exit(0)
 
-          # Ensure all required feature cols exist (fill missing with 0)
+          # Ensure all feature columns exist (fill missing with 0.0)
           for c in feats:
             if c not in df.columns:
               df = df.with_columns(pl.lit(0.0).alias(c))
 
-          # Score via logistic function: z = intercept + sum(coef_i * x_i)
-          coef = model.get("coef", [])
-          intercept = float(model.get("intercept", 0.0))
-
-          # Convert features to lists of rows for a lightweight loop
-          X = df.select(feats).to_numpy()  # small; fine for reporting
+          # Compute probabilities without NumPy: iterate rows
           def sigmoid(z): return 1.0 / (1.0 + math.exp(-z))
           probs = []
-          for row in X:
+          for row in df.select(feats).iter_rows():
             z = intercept + sum(ci * float(xi) for ci, xi in zip(coef, row))
             probs.append(sigmoid(z))
 
-          # Assemble output table
-          out_cols = [c for c in ["season","week","game_id","home_team","away_team","spread_line","total_line","implied_margin","implied_total"] if c in df.columns]
-          out = df.select(out_cols).with_columns(pl.Series("home_win_prob", probs))
-          out = out.sort("home_win_prob", descending=True)
+          # Build output table
+          base_cols = [c for c in ["season","week","game_id","home_team","away_team","spread_line","total_line","implied_margin","implied_total"] if c in df.columns]
+          out = df.select(base_cols).with_columns(pl.Series("home_win_prob", probs)).sort("home_win_prob", descending=True)
 
           os.makedirs("models", exist_ok=True)
           out.write_csv("models/predictions.csv")
 
-          # Try load metrics
+          # Load metrics (if present) for the report
           metrics = {}
           try:
             with open("models/training_metrics.json") as f:
@@ -341,11 +344,10 @@ jobs:
           except Exception:
             pass
 
-          # Build markdown (no pandas; iterate Polars rows)
+          # Render markdown report (top 5 by prob)
           def fmt(v, nd=3):
             try:
-              fv = float(v)
-              return f"{fv:.{nd}f}"
+              return f"{float(v):.{nd}f}"
             except Exception:
               return str(v)
 
@@ -369,13 +371,7 @@ jobs:
             lines.append("| season | week | game_id | home_team | away_team | home_win_prob |")
             lines.append("|---:|---:|---|---|---|---:|")
             for r in top.iter_rows(named=True):
-              season = r.get("season","")
-              week = r.get("week","")
-              game_id = r.get("game_id","")
-              ht = r.get("home_team","")
-              at = r.get("away_team","")
-              p = r.get("home_win_prob", 0.0)
-              lines.append(f"| {season} | {week} | {game_id} | {ht} | {at} | {fmt(p,3)} |")
+              lines.append(f"| {r.get('season','')} | {r.get('week','')} | {r.get('game_id','')} | {r.get('home_team','')} | {r.get('away_team','')} | {fmt(r.get('home_win_prob',0.0),3)} |")
 
           with open("models/report.md","w") as f:
             f.write("\n".join(lines))
@@ -389,4 +385,5 @@ jobs:
             models/predictions.csv
             models/report.md
           retention-days: 30
+
 
