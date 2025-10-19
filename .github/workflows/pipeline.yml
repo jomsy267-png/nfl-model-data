@@ -701,7 +701,7 @@ jobs:
           retention-days: 30
 
   discord_push:
-    name: Post daily report to Discord (zipped bundle)
+    name: Post daily report to Discord (zipped bundle incl. schedules/rosters)
     needs: [predict_and_report, backtest]
     runs-on: ubuntu-latest
     steps:
@@ -712,7 +712,7 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      # Pull artifacts we want to zip & send
+      # Core artifacts
       - name: Download predictions artifact
         uses: actions/download-artifact@v4
         with:
@@ -754,6 +754,21 @@ jobs:
           path: models
         continue-on-error: true
 
+      # NEW: schedules + rosters so the bundle always includes them
+      - name: Download schedules artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: schedules_split
+          path: models
+        continue-on-error: true
+
+      - name: Download rosters artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rosters
+          path: models
+        continue-on-error: true
+
       - name: Build short Discord message (<= 2000 chars)
         shell: bash
         run: |
@@ -775,7 +790,7 @@ jobs:
               sed -n '1,15p' models/backtest_report.md
               echo
             fi
-            echo "_Attached: zipped bundle with reports, predictions, and metrics._"
+            echo "_Attached: zipped bundle with predictions, reports, schedules, rosters, and metrics._"
           } > discord_message.txt
           head -c 1900 discord_message.txt > discord_message_trimmed.txt
           CONTENT=$(jq -Rs '.' < discord_message_trimmed.txt)
@@ -788,19 +803,37 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          add_if_exists () { if [ -f "$1" ]; then cp -f "$1" "out/$(basename "$1")"; echo "Added: $1"; else echo "Missing: $1"; fi; }
+          add_if_exists () {
+            if [ -f "$1" ]; then
+              cp -f "$1" "out/$(basename "$1")"
+              echo "Added: $1"
+            else
+              echo "Missing: $1"
+            fi
+          }
+
           # Core deliverables
           add_if_exists models/report.md
           add_if_exists models/predictions.csv
           add_if_exists models/backtest_report.md
-          # Useful metrics/config if present
+
+          # Metrics/config if present
           add_if_exists models/training_metrics.json
           add_if_exists models/backtest_metrics.json
           add_if_exists models/blend_metrics.json
           add_if_exists models/xgb_metrics.json
           add_if_exists models/calibrator_isotonic.json
-          # Placeholder if empty
-          if [ -z "$(ls -A out || true)" ]; then echo "No output files found to include." > out/README.txt; fi
+
+          # NEW: schedules + rosters (names depend on earlier jobs)
+          add_if_exists models/schedules_2025.csv
+          add_if_exists models/schedules_all.csv
+          add_if_exists models/rosters_2025.csv
+
+          # If nothing collected, add a placeholder
+          if [ -z "$(ls -A out || true)" ]; then
+            echo "No output files found to include." > out/README.txt
+          fi
+
           BUNDLE="NFL_Bundle_${GITHUB_REPOSITORY//\//_}_run${GITHUB_RUN_NUMBER}.zip"
           (cd out && zip -q -r "../${BUNDLE}" .)
           echo "bundle=${BUNDLE}" >> "$GITHUB_OUTPUT"
@@ -820,11 +853,20 @@ jobs:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           set -euo pipefail
-          if [ -z "${WEBHOOK:-}" ]; then echo "ERROR: Missing DISCORD_WEBHOOK_URL secret"; exit 1; fi
+          if [ -z "${WEBHOOK:-}" ]; then
+            echo "ERROR: Missing DISCORD_WEBHOOK_URL secret"
+            exit 1
+          fi
+
           BUNDLE="${{ steps.zipstep.outputs.bundle }}"
-          if [ ! -f "$BUNDLE" ]; then echo "ERROR: Missing bundle zip: $BUNDLE"; exit 1; fi
+          if [ ! -f "$BUNDLE" ]; then
+            echo "ERROR: Missing bundle zip: $BUNDLE"
+            exit 1
+          fi
+
           # Use --form-string so payload_json is not uploaded as a file
           curl -sS -X POST "$WEBHOOK" \
             --form-string "payload_json=$(cat payload.json)" \
             -F "file1=@${BUNDLE}" > /dev/null
+
           echo "Sent Discord message with bundle: ${BUNDLE}"
