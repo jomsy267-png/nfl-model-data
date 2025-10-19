@@ -4,7 +4,6 @@ on:
 
 jobs:
   fetch_schedules:
-    name: Fetch schedules (scores + closing lines)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -12,36 +11,40 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Create folder
-        run: mkdir -p data/external
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Download schedules
+      - name: Install deps
         run: |
-          set -euo pipefail
-          BASE="https://github.com/nflverse/nflverse-data/releases/download/schedules"
-          for FN in schedules.csv.gz schedules.csv; do
-            URL="${BASE}/${FN}"
-            echo "Trying ${URL}"
-            if curl -fL --retry 5 --retry-delay 2 "$URL" -o "data/external/${FN}"; then
-              echo "Downloaded ${FN}"
-              break
-            fi
-          done
-          test -e data/external/schedules.csv.gz || test -e data/external/schedules.csv
+          python -m pip install --upgrade pip
+          pip install nflreadpy pandas
 
-      - name: Split into yearly files
+      - name: Download schedules via nflreadpy and split by year
         run: |
-          set -euo pipefail
-          cd data/external
-          if [ -f schedules.csv.gz ]; then
-            gzip -dc schedules.csv.gz > schedules.csv
-          fi
-          awk -F, 'NR==1{hdr=$0; next} {out=sprintf("schedules_%s.csv",$2); if(!(out in seen)){print hdr > out; seen[out]=1} print >> out}' schedules.csv
-          ls -l schedules_*.csv | head -n 10
+          python - << 'PY'
+          import os
+          import pandas as pd
+          import nflreadpy as nfl  # official python port of nflreadr
+          os.makedirs("data/external", exist_ok=True)
 
-      - name: Upload artifact
+          df = nfl.load_schedules()                 # all seasons (past+future)
+          # Persist a full CSV (optional but handy for inspection)
+          df.to_csv("data/external/schedules_all.csv", index=False)
+
+          # Split by season for downstream steps
+          for season, sdf in df.groupby("season"):
+            out = f"data/external/schedules_{season}.csv"
+            sdf.to_csv(out, index=False)
+            print(f"Wrote {out} ({len(sdf)} rows)")
+          PY
+
+      - name: Upload schedules artifact
         uses: actions/upload-artifact@v4
         with:
           name: schedules_split
-          path: data/external/schedules_*.csv
+          path: |
+            data/external/schedules_all.csv
+            data/external/schedules_*.csv
           retention-days: 7
