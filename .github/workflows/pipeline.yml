@@ -1,27 +1,24 @@
 name: nfl-pipeline
 
 on:
-  # Run manually anytime
   workflow_dispatch:
-  # Run daily at 10:00 AM America/Edmonton, accounting for DST shift
   schedule:
-    # DST window (MDT): roughly March–October
-    - cron: "0 16 * 3-10 *"
-    # Standard time (MST): November–February
-    - cron: "0 17 * 11,12,1,2 *"
+    # Edmonton 10:00 daily (DST aware via two cron lines)
+    - cron: "0 16 * 3-10 *"   # Mar–Oct ~ MDT (UTC-6)
+    - cron: "0 17 * 11,12,1,2 *" # Nov–Feb ~ MST (UTC-7)
 
 permissions:
   contents: write
 
 jobs:
   fetch_schedules:
-    name: Fetch schedules (scores + closing lines)
+    name: Fetch schedules (scores + closing lines) with fallback
     runs-on: ubuntu-latest
     steps:
       - name: Print current times (UTC & Edmonton)
         run: |
           echo "UTC:       $(date -u)"
-          TZ=America/Edmonton date +"Edmonton: %Y-%m-%d %H:%M:%S %Z"
+          TZ=America/Edmonton date +"%Y-%m-%d %H:%M:%S %Z"
 
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -30,28 +27,53 @@ jobs:
         uses: actions/setup-python@v5
         with: { python-version: "3.11" }
 
-      - name: Install deps
+      - name: Install deps (both loaders)
         run: |
           python -m pip install --upgrade pip
-          pip install nflreadpy polars
+          pip install polars nflreadpy nfl_data_py pandas
 
-      - name: Download schedules via nflreadpy and split by year (Polars)
+      - name: Download schedules (try nflreadpy, fallback to nfl_data_py)
         run: |
           python - << 'PY'
-          import os
+          import os, sys, datetime
           import polars as pl
-          import nflreadpy as nfl
           os.makedirs("data/external", exist_ok=True)
 
-          df = nfl.load_schedules()
-          df.write_csv("data/external/schedules_all.csv")
+          def write_and_split(df_pl: pl.DataFrame):
+              df_pl.write_csv("data/external/schedules_all.csv")
+              if "season" not in df_pl.columns:
+                  print("No 'season' column; wrote schedules_all.csv only.", file=sys.stderr)
+                  return
+              for season in sorted(df_pl.get_column("season").unique().to_list()):
+                  sdf = df_pl.filter(pl.col("season") == season)
+                  out = f"data/external/schedules_{season}.csv"
+                  sdf.write_csv(out)
+                  print(f"Wrote {out} ({sdf.height} rows)")
 
-          seasons = df.get_column("season").unique().to_list()
-          for season in sorted(seasons):
-            sdf = df.filter(pl.col("season") == season)
-            out = f"data/external/schedules_{season}.csv"
-            sdf.write_csv(out)
-            print(f"Wrote {out} ({sdf.height} rows)")
+          # 1) Try nflreadpy
+          try:
+              import nflreadpy as nfl
+              print("Trying nflreadpy.load_schedules() ...")
+              df = nfl.load_schedules()
+              try:
+                  import pandas as pd
+                  df_pl = pl.from_pandas(df) if isinstance(df, pd.DataFrame) else df
+              except Exception:
+                  df_pl = pl.DataFrame(df)
+              write_and_split(df_pl)
+          except Exception as e:
+              print(f"[WARN] nflreadpy failed: {e}", file=sys.stderr)
+              print("Falling back to nfl_data_py.import_schedules(...)")
+              try:
+                  import nfl_data_py as ndp, pandas as pd
+                  this_year = datetime.datetime.utcnow().year
+                  years = list(range(1999, this_year + 1))
+                  df_pd = ndp.import_schedules(years)
+                  df_pl = pl.from_pandas(df_pd)
+                  write_and_split(df_pl)
+              except Exception as e2:
+                  print(f"[ERROR] nfl_data_py fallback failed: {e2}", file=sys.stderr)
+                  sys.exit(2)
           PY
 
       - name: Upload schedules artifact
@@ -70,7 +92,7 @@ jobs:
       - name: Print current times (UTC & Edmonton)
         run: |
           echo "UTC:       $(date -u)"
-          TZ=America/Edmonton date +"Edmonton: %Y-%m-%d %H:%M:%S %Z"
+          TZ=America/Edmonton date +"%Y-%m-%d %H:%M:%S %Z"
 
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -82,14 +104,13 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install nflreadpy polars
+          pip install polars nflreadpy
 
-      - name: Download PBP via nflreadpy (Polars)
+      - name: Download PBP via nflreadpy
         run: |
           python - << 'PY'
           import os, polars as pl, nflreadpy as nfl
           os.makedirs("data/raw/nflverse__nflfastR-play-by-play-data", exist_ok=True)
-
           seasons = [2022, 2023, 2024, 2025]
           df = nfl.load_pbp(seasons=seasons)
           for s in seasons:
@@ -114,7 +135,7 @@ jobs:
       - name: Print current times (UTC & Edmonton)
         run: |
           echo "UTC:       $(date -u)"
-          TZ=America/Edmonton date +"Edmonton: %Y-%m-%d %H:%M:%S %Z"
+          TZ=America/Edmonton date +"%Y-%m-%d %H:%M:%S %Z"
 
       - uses: actions/checkout@v4
 
@@ -150,6 +171,178 @@ jobs:
           path: data/processed/team_week_features.csv
           retention-days: 7
 
+  train:
+    name: Train logistic model
+    needs: [build_features]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print current times (UTC & Edmonton)
+        run: |
+          echo "UTC:       $(date -u)"
+          TZ=America/Edmonton date +"%Y-%m-%d %H:%M:%S %Z"
+
+      - uses: actions/checkout@v4
+
+      - name: Download features artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: team_features
+          path: team_features
+
+      - name: Move features into expected path
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data/processed models
+          if [ -f team_features/team_week_features.csv ]; then
+            SRC="team_features/team_week_features.csv"
+          elif [ -f team_features/data/processed/team_week_features.csv ]; then
+            SRC="team_features/data/processed/team_week_features.csv"
+          elif [ -f data/processed/team_week_features.csv ]; then
+            echo "Found data/processed/team_week_features.csv already in place."
+            exit 0
+          else
+            echo "ERROR: Could not find team_week_features.csv in the downloaded artifact." >&2
+            ls -laR team_features || true
+            exit 2
+          fi
+          cp "$SRC" data/processed/team_week_features.csv
+          echo "Copied $SRC -> data/processed/team_week_features.csv"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install polars numpy scikit-learn
+
+      - name: Train model
+        run: |
+          python scripts/train_model.py \
+            --features data/processed/team_week_features.csv \
+            --out_model models/nfl_model.json \
+            --out_metrics models/training_metrics.json \
+            --out_latest_features models/latest_team_features.csv
+
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: model_artifacts
+          path: |
+            models/nfl_model.json
+            models/training_metrics.json
+            models/latest_team_features.csv
+          retention-days: 30
+
+  calibrate:
+    name: Fit isotonic calibrator
+    needs: [train]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print current times (UTC & Edmonton)
+        run: |
+          echo "UTC:       $(date -u)"
+          TZ=America/Edmonton date +"%Y-%m-%d %H:%M:%S %Z"
+
+      - uses: actions/checkout@v4
+
+      - name: Download model artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: model_artifacts
+          path: models
+
+      - name: Download features artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: team_features
+          path: data/processed
+
+      - name: Install deps (lean)
+        run: |
+          python -m pip install --upgrade pip
+          pip install polars scikit-learn
+
+      - name: Fit isotonic calibrator
+        run: |
+          python scripts/calibrate_winprob.py \
+            --features_csv data/processed/team_week_features.csv \
+            --model_json models/nfl_model.json \
+            --out_json models/calibrator_isotonic.json
+
+      - name: Upload calibrator artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: calibrator
+          path: models/calibrator_isotonic.json
+          retention-days: 30
+
+  backtest:
+    name: Historical backtest
+    needs: [train, calibrate]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print current times (UTC & Edmonton)
+        run: |
+          echo "UTC:       $(date -u)"
+          TZ=America/Edmonton date +"%Y-%m-%d %H:%M:%S %Z"
+
+      - uses: actions/checkout@v4
+
+      - name: Download model artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: model_artifacts
+          path: models
+
+      - name: Download features artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: team_features
+          path: data/processed
+
+      - name: Download calibrator (optional)
+        uses: actions/download-artifact@v4
+        with:
+          name: calibrator
+          path: models
+        continue-on-error: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install polars
+
+      - name: Run backtest
+        run: |
+          python scripts/backtest.py \
+            --features_csv data/processed/team_week_features.csv \
+            --model_json models/nfl_model.json \
+            --calibrator_json models/calibrator_isotonic.json \
+            --out_dir models
+
+      - name: Build backtest report (Markdown)
+        run: |
+          python scripts/backtest_report.py
+
+      - name: Upload backtest artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest
+          path: |
+            models/backtest_by_game.csv
+            models/backtest_by_season.csv
+            models/backtest_by_week.csv
+            models/backtest_metrics.json
+            models/backtest_report.md
+          retention-days: 30
+
   train_xgb:
     name: Train XGBoost model
     needs: [build_features]
@@ -158,7 +351,7 @@ jobs:
       - name: Print current times (UTC & Edmonton)
         run: |
           echo "UTC:       $(date -u)"
-          TZ=America/Edmonton date +"Edmonton: %Y-%m-%d %H:%M:%S %Z"
+          TZ=America/Edmonton date +"%Y-%m-%d %H:%M:%S %Z"
 
       - uses: actions/checkout@v4
 
@@ -192,92 +385,6 @@ jobs:
           path: |
             models/xgb_model.json
             models/xgb_metrics.json
-          retention-days: 30
-
-  train:
-    name: Train toy model (logistic regression)
-    needs: [build_features]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Print current times (UTC & Edmonton)
-        run: |
-          echo "UTC:       $(date -u)"
-          TZ=America/Edmonton date +"Edmonton: %Y-%m-%d %H:%M:%S %Z"
-
-      - uses: actions/checkout@v4
-
-      # Download features artifact into ./team_features/
-      - name: Download features artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: team_features
-          path: team_features
-
-      - name: Inspect workspace (before training)
-        run: |
-          echo "PWD: $(pwd)"
-          echo "--- top level ---"
-          ls -la
-          echo "--- team_features (artifact contents) ---"
-          ls -laR team_features || true
-          echo "--- data/processed (pre-existing, if any) ---"
-          ls -laR data/processed || true
-
-      # Robustly locate team_week_features.csv regardless of artifact layout
-      - name: Move features into expected path
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p data/processed models
-          if [ -f team_features/team_week_features.csv ]; then
-            SRC="team_features/team_week_features.csv"
-          elif [ -f team_features/data/processed/team_week_features.csv ]; then
-            SRC="team_features/data/processed/team_week_features.csv"
-          elif [ -f data/processed/team_week_features.csv ]; then
-            echo "Found data/processed/team_week_features.csv already in place."
-            exit 0
-          else
-            echo "ERROR: Could not find team_week_features.csv in the downloaded artifact." >&2
-            echo "Tree of ./team_features for debugging:" >&2
-            ls -laR team_features || true
-            exit 2
-          fi
-          cp "$SRC" data/processed/team_week_features.csv
-          echo "Copied $SRC -> data/processed/team_week_features.csv"
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install polars numpy scikit-learn
-
-      - name: Train model
-        shell: bash
-        run: |
-          set -euo pipefail
-          python scripts/train_model.py --features data/processed/team_week_features.csv --out_model models/nfl_model.json --out_metrics models/training_metrics.json --out_latest_features models/latest_team_features.csv
-
-      - name: Show produced model files
-        run: |
-          echo "--- models dir ---"
-          ls -la models || true
-          echo "--- metrics preview ---"
-          test -f models/training_metrics.json && head -n 50 models/training_metrics.json || echo "metrics missing"
-          echo "--- latest features preview ---"
-          test -f models/latest_team_features.csv && head -n 5 models/latest_team_features.csv || echo "latest features missing"
-
-      - name: Upload model artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: model_artifacts
-          path: |
-            models/nfl_model.json
-            models/training_metrics.json
-            models/latest_team_features.csv
-          if-no-files-found: error
           retention-days: 30
 
   blend_models:
@@ -337,128 +444,6 @@ jobs:
             models/blend_metrics.json
           retention-days: 30
 
-  calibrate:
-    name: Fit isotonic calibrator
-    needs: [train]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Print current times (UTC & Edmonton)
-        run: |
-          echo "UTC:       $(date -u)"
-          TZ=America/Edmonton date +"Edmonton: %Y-%m-%d %H:%M:%S %Z"
-
-      - uses: actions/checkout@v4
-
-      - name: Download model artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: model_artifacts
-          path: models
-
-      - name: Download features artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: team_features
-          path: data/processed
-
-      # STEP 2 (Install deps) — choose ONE option (A recommended)
-      - name: Install deps (lean)
-        run: |
-          python -m pip install --upgrade pip
-          pip install polars scikit-learn
-
-      # - name: Install deps (expanded)
-      #   run: |
-      #     python -m pip install --upgrade pip
-      #     pip install numpy scipy scikit-learn polars
-
-      - name: Fit isotonic calibrator
-        run: |
-          python scripts/calibrate_winprob.py \
-            --features_csv data/processed/team_week_features.csv \
-            --model_json models/nfl_model.json \
-            --out_json models/calibrator_isotonic.json
-
-      - name: Show calibrator
-        run: |
-          echo "--- models dir ---"
-          ls -la models || true
-          echo "--- calibrator preview ---"
-          test -f models/calibrator_isotonic.json && head -n 40 models/calibrator_isotonic.json || echo "no calibrator saved"
-
-      - name: Upload calibrator artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: calibrator
-          path: models/calibrator_isotonic.json
-          if-no-files-found: warn
-          retention-days: 30
-
-  backtest:
-    name: Historical backtest
-    needs: [train, calibrate]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Print current times (UTC & Edmonton)
-        run: |
-          echo "UTC:       $(date -u)"
-          TZ=America/Edmonton date +"Edmonton: %Y-%m-%d %H:%M:%S %Z"
-
-      - uses: actions/checkout@v4
-
-      - name: Download model artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: model_artifacts
-          path: models
-
-      - name: Download features artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: team_features
-          path: data/processed
-
-      - name: Download calibrator (optional)
-        uses: actions/download-artifact@v4
-        with:
-          name: calibrator
-          path: models
-        continue-on-error: true
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install polars
-
-      - name: Run backtest
-        run: |
-          python scripts/backtest.py \
-            --features_csv data/processed/team_week_features.csv \
-            --model_json models/nfl_model.json \
-            --calibrator_json models/calibrator_isotonic.json \
-            --out_dir models
-
-      - name: Build backtest report (Markdown)
-        run: |
-          python scripts/backtest_report.py
-
-      - name: Upload backtest artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: backtest
-          path: |
-            models/backtest_by_game.csv
-            models/backtest_by_season.csv
-            models/backtest_by_week.csv
-            models/backtest_metrics.json
-            models/backtest_report.md
-          retention-days: 30
-
   predict_and_report:
     name: Score upcoming games + report (blend-aware, null-safe, calibrated)
     needs: [train, calibrate, blend_models]
@@ -506,8 +491,7 @@ jobs:
 
       - name: Set up Python
         uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        with: { python-version: "3.11" }
 
       - name: Install deps
         run: |
@@ -520,12 +504,10 @@ jobs:
           import json, os, sys, bisect
           import polars as pl
 
-          def load_json(path):
-            with open(path) as f:
-              return json.load(f)
+          def load_json(p):
+            with open(p) as f: return json.load(f)
 
           # Choose model: blended if available else logistic
-          model = None
           if os.path.exists("models/blended_model.json"):
             model = load_json("models/blended_model.json")
           else:
@@ -544,7 +526,6 @@ jobs:
 
           df = pl.read_csv(features_path)
 
-          # Scoring helpers
           def ensure_cols(df, cols):
             for c in cols:
               if c not in df.columns:
@@ -557,25 +538,17 @@ jobs:
               logit = logit + pl.col(c) * float(w)
             return (1 / (1 + (-logit).exp())).alias("p_logit")
 
-          p_raw_expr = None
-
+          # Build p_raw
           if model.get("model_type") == "blend_linear" and \
-             os.path.exists("models/nfl_model.json") and \
-             os.path.exists("models/xgb_model.json"):
-
-            # Load components
+             os.path.exists("models/nfl_model.json") and os.path.exists("models/xgb_model.json"):
             lm = load_json("models/nfl_model.json")
             xm = load_json("models/xgb_model.json")
-
-            feats_l = lm.get("features", [])
-            feats_x = xm.get("features", [])
+            feats_l = lm.get("features", []); feats_x = xm.get("features", [])
             df = ensure_cols(df, list(dict.fromkeys(feats_l + feats_x)))
 
-            # logistic prob as column
-            p_logit = score_logistic_expr(df, feats_l, lm.get("coef", []), lm.get("intercept", 0.0))
-            df = df.with_columns(p_logit)
-
-            # xgb prob as column (requires numpy + xgboost)
+            # logistic part
+            df = df.with_columns(score_logistic_expr(df, feats_l, lm.get("coef", []), lm.get("intercept", 0.0)))
+            # xgb part
             import numpy as np, xgboost as xgb
             dmat = xgb.DMatrix(df.select(feats_x).to_numpy())
             booster = xgb.Booster(); booster.load_model(bytearray(xm["booster_json"], "utf-8"))
@@ -583,51 +556,37 @@ jobs:
             df = df.with_columns(pl.Series("p_xgb", p_xgb))
 
             a = float(model.get("alpha_logistic", 0.5))
-            p_raw_expr = (a*pl.col("p_logit") + (1-a)*pl.col("p_xgb")).alias("p_raw")
-
+            df = df.with_columns((a*pl.col("p_logit") + (1-a)*pl.col("p_xgb")).alias("p_raw"))
           else:
-            # Fallback: logistic only
-            feats = model.get("features", [])
-            coef  = model.get("coef", [])
-            intercept = model.get("intercept", 0.0)
+            feats = model.get("features", []); coef = model.get("coef", []); intercept = model.get("intercept", 0.0)
             df = ensure_cols(df, feats)
-            p_raw_expr = score_logistic_expr(df, feats, coef, intercept).alias("p_raw")
-
-          # Build p_raw
-          df = df.with_columns(p_raw_expr)
+            df = df.with_columns(score_logistic_expr(df, feats, coef, intercept).alias("p_raw"))
 
           # Optional isotonic calibration
-          calibrator = None
           if os.path.exists("models/calibrator_isotonic.json"):
             try:
               c = load_json("models/calibrator_isotonic.json")
-              if c.get("type") == "isotonic":
-                calibrator = (c["x_thresholds"], c["y_values"])
+              xs, ys = c["x_thresholds"], c["y_values"]
+              def calibrate_scalar(p):
+                i = bisect.bisect_right(xs, float(p)) - 1
+                if i < 0: return float(ys[0])
+                if i >= len(xs) - 1: return float(ys[-1])
+                x0, x1 = xs[i], xs[i+1]; y0, y1 = ys[i], ys[i+1]
+                if x1 == x0: return float(y0)
+                t = (float(p) - x0) / (x1 - x0)
+                return float(y0 + t * (y1 - y0))
+              df = df.with_columns(pl.col("p_raw").map_elements(calibrate_scalar).alias("home_win_prob"))
             except Exception:
-              calibrator = None
-
-          if calibrator:
-            xs, ys = calibrator
-            def calibrate_scalar(p):
-              i = bisect.bisect_right(xs, float(p)) - 1
-              if i < 0: return float(ys[0])
-              if i >= len(xs) - 1: return float(ys[-1])
-              x0, x1 = xs[i], xs[i+1]; y0, y1 = ys[i], ys[i+1]
-              if x1 == x0: return float(y0)
-              t = (float(p) - x0) / (x1 - x0)
-              return float(y0 + t * (y1 - y0))
-            df = df.with_columns(pl.col("p_raw").map_elements(calibrate_scalar).alias("home_win_prob"))
+              df = df.with_columns(pl.col("p_raw").alias("home_win_prob"))
           else:
             df = df.with_columns(pl.col("p_raw").alias("home_win_prob"))
 
-          # Output
           base_cols = [c for c in ["season","week","game_id","home_team","away_team","spread_line","total_line","implied_margin","implied_total"] if c in df.columns]
           out = df.select(base_cols + ["home_win_prob"]).sort("home_win_prob", descending=True)
 
           os.makedirs("models", exist_ok=True)
           out.write_csv("models/predictions.csv")
 
-          # Minimal markdown
           def fmt(v, nd=3):
             try: return f"{float(v):.{nd}f}"
             except: return str(v)
@@ -644,7 +603,6 @@ jobs:
             lines.append("|---:|---:|---|---|---|---:|")
             for r in top.iter_rows(named=True):
               lines.append(f"| {r.get('season','')} | {r.get('week','')} | {r.get('game_id','')} | {r.get('home_team','')} | {r.get('away_team','')} | {fmt(r.get('home_win_prob',0.0),3)} |")
-
           with open("models/report.md","w") as f:
             f.write("\n".join(lines))
           PY
@@ -713,15 +671,12 @@ jobs:
         continue-on-error: true
 
       - name: Build short Discord message (<= 2000 chars)
-        id: build_msg
         shell: bash
         run: |
           set -euo pipefail
-
           REPO="${GITHUB_REPOSITORY}"
           RUN="${GITHUB_RUN_NUMBER}"
           DATE_UTC="$(date -u '+%Y-%m-%d %H:%M UTC')"
-
           {
             echo "**NFL Daily — ${REPO} #${RUN}**"
             echo "_${DATE_UTC}_"
@@ -738,11 +693,7 @@ jobs:
             fi
             echo "_Attached: zipped bundle with reports, predictions, and metrics._"
           } > discord_message.txt
-
-          # Trim to Discord hard limit
           head -c 1900 discord_message.txt > discord_message_trimmed.txt
-
-          # Build payload JSON as a STRING (not a file upload)
           CONTENT=$(jq -Rs '.' < discord_message_trimmed.txt)
           echo "{\"content\": ${CONTENT}}" > payload.json
           echo "payload.json built"
@@ -753,33 +704,19 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-
-          add_if_exists () {
-            if [ -f "$1" ]; then
-              cp -f "$1" "out/$(basename "$1")"
-              echo "Added: $1"
-            else
-              echo "Missing (skipped): $1"
-            fi
-          }
-
+          add_if_exists () { if [ -f "$1" ]; then cp -f "$1" "out/$(basename "$1")"; echo "Added: $1"; else echo "Missing: $1"; fi; }
           # Core deliverables
           add_if_exists models/report.md
           add_if_exists models/predictions.csv
           add_if_exists models/backtest_report.md
-
           # Useful metrics/config if present
           add_if_exists models/training_metrics.json
           add_if_exists models/backtest_metrics.json
           add_if_exists models/blend_metrics.json
           add_if_exists models/xgb_metrics.json
           add_if_exists models/calibrator_isotonic.json
-
-          # If nothing collected, include a placeholder
-          if [ -z "$(ls -A out || true)" ]; then
-            echo "No output files found to include." > out/README.txt
-          fi
-
+          # Placeholder if empty
+          if [ -z "$(ls -A out || true)" ]; then echo "No output files found to include." > out/README.txt; fi
           BUNDLE="NFL_Bundle_${GITHUB_REPOSITORY//\//_}_run${GITHUB_RUN_NUMBER}.zip"
           (cd out && zip -q -r "../${BUNDLE}" .)
           echo "bundle=${BUNDLE}" >> "$GITHUB_OUTPUT"
@@ -790,10 +727,8 @@ jobs:
         run: |
           set -euo pipefail
           BUNDLE="${{ steps.zipstep.outputs.bundle }}"
-          echo "--- models dir ---"
-          ls -la models || true
-          echo "--- zip listing ---"
-          unzip -l "$BUNDLE" || (echo "unzip not available; printing zip file name only"; ls -la "$BUNDLE")
+          echo "--- models dir ---"; ls -la models || true
+          echo "--- zip listing ---"; unzip -l "$BUNDLE" || (echo "unzip unavailable"; ls -la "$BUNDLE")
 
       - name: Send to Discord (message + ZIP only)
         shell: bash
@@ -801,26 +736,11 @@ jobs:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: |
           set -euo pipefail
-
-          if [ -z "${WEBHOOK:-}" ]; then
-            echo "ERROR: Missing DISCORD_WEBHOOK_URL secret"
-            exit 1
-          fi
-
+          if [ -z "${WEBHOOK:-}" ]; then echo "ERROR: Missing DISCORD_WEBHOOK_URL secret"; exit 1; fi
           BUNDLE="${{ steps.zipstep.outputs.bundle }}"
-          if [ ! -f "$BUNDLE" ]; then
-            echo "ERROR: Missing bundle zip: $BUNDLE"
-            exit 1
-          fi
-
-          # Send via webhook (multipart/form-data)
-          # Use --form-string so payload_json is treated as a string param (NOT a file)
+          if [ ! -f "$BUNDLE" ]; then echo "ERROR: Missing bundle zip: $BUNDLE"; exit 1; fi
+          # Use --form-string so payload_json is not uploaded as a file
           curl -sS -X POST "$WEBHOOK" \
             --form-string "payload_json=$(cat payload.json)" \
             -F "file1=@${BUNDLE}" > /dev/null
-
           echo "Sent Discord message with bundle: ${BUNDLE}"
-
-
-
-
