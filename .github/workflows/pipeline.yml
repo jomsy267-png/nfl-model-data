@@ -342,6 +342,10 @@ jobs:
             --calibrator_json models/calibrator_isotonic.json \
             --out_dir models
 
+      - name: Build backtest report (Markdown)
+        run: |
+          python scripts/backtest_report.py
+
       - name: Upload backtest artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -351,8 +355,8 @@ jobs:
             models/backtest_by_season.csv
             models/backtest_by_week.csv
             models/backtest_metrics.json
+            models/backtest_report.md
           retention-days: 30
-
 
   predict_and_report:
     name: Score upcoming games + report (pure Polars, null-safe, calibrated if available)
