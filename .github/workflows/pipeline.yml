@@ -19,25 +19,25 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install nflreadpy pandas
+          pip install nflreadpy polars
 
-      - name: Download schedules via nflreadpy and split by year
+      - name: Download schedules via nflreadpy and split by year (Polars)
         run: |
           python - << 'PY'
           import os
-          import pandas as pd
-          import nflreadpy as nfl  # official python port of nflreadr
+          import polars as pl
+          import nflreadpy as nfl  # returns Polars DataFrames
           os.makedirs("data/external", exist_ok=True)
 
-          df = nfl.load_schedules()                 # all seasons (past+future)
-          # Persist a full CSV (optional but handy for inspection)
-          df.to_csv("data/external/schedules_all.csv", index=False)
+          df = nfl.load_schedules()  # Polars DataFrame
+          df.write_csv("data/external/schedules_all.csv")
 
-          # Split by season for downstream steps
-          for season, sdf in df.groupby("season"):
+          seasons = df.get_column("season").unique().to_list()
+          for season in seasons:
+            sdf = df.filter(pl.col("season") == season)
             out = f"data/external/schedules_{season}.csv"
-            sdf.to_csv(out, index=False)
-            print(f"Wrote {out} ({len(sdf)} rows)")
+            sdf.write_csv(out)
+            print(f"Wrote {out} ({sdf.height} rows)")
           PY
 
       - name: Upload schedules artifact
