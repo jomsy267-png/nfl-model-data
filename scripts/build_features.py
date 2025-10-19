@@ -48,19 +48,18 @@ def build_team_history(sched: pl.DataFrame) -> pl.DataFrame:
     # Sort chronologically within team
     team_games = team_games.sort(["team", "date", "week"])
 
-    # Add raw outcomes
+    # Outcomes
     team_games = team_games.with_columns([
         (pl.col("pts_for") - pl.col("pts_against")).alias("margin"),
         (pl.col("pts_for") > pl.col("pts_against")).cast(pl.Int8).alias("win")
     ])
 
-    # ✅ Version-proof rest days:
-    # Convert Date to epoch-days (Int32), diff within team, yields integer day gaps.
+    # Version-proof rest days (integer day gaps between games per team)
     team_games = team_games.with_columns(
         pl.col("date").cast(pl.Int32).diff().over("team").alias("rest_days")
     )
 
-    # Rolling features (exclude current game: shift(1))
+    # Rolling features (exclude current game by using shift(1) before roll)
     def add_rolls(g: pl.DataFrame) -> pl.DataFrame:
         g = g.with_columns([
             pl.col("pts_for").shift(1).alias("_pf_lag"),
@@ -81,9 +80,10 @@ def build_team_history(sched: pl.DataFrame) -> pl.DataFrame:
         ])
         return g.drop(["_pf_lag","_pa_lag","_m_lag","_w_lag"])
 
+    # ✅ Polars uses group_by (underscore) on your runner
     team_games = (
         team_games
-        .groupby("team", maintain_order=True)
+        .group_by("team", maintain_order=True)
         .map_groups(add_rolls)
     )
 
