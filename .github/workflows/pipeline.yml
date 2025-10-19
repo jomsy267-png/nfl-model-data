@@ -150,6 +150,50 @@ jobs:
           path: data/processed/team_week_features.csv
           retention-days: 7
 
+  train_xgb:
+    name: Train XGBoost model
+    needs: [build_features]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print current times (UTC & Edmonton)
+        run: |
+          echo "UTC:       $(date -u)"
+          TZ=America/Edmonton date +"Edmonton: %Y-%m-%d %H:%M:%S %Z"
+
+      - uses: actions/checkout@v4
+
+      - name: Download features artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: team_features
+          path: data/processed
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install polars scikit-learn xgboost
+
+      - name: Train XGB
+        run: |
+          mkdir -p models
+          python scripts/train_xgb.py \
+            --features data/processed/team_week_features.csv \
+            --out_model models/xgb_model.json \
+            --out_metrics models/xgb_metrics.json
+
+      - name: Upload XGB artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: xgb_artifacts
+          path: |
+            models/xgb_model.json
+            models/xgb_metrics.json
+          retention-days: 30
+
   train:
     name: Train toy model (logistic regression)
     needs: [build_features]
@@ -234,6 +278,63 @@ jobs:
             models/training_metrics.json
             models/latest_team_features.csv
           if-no-files-found: error
+          retention-days: 30
+
+  blend_models:
+    name: Blend logistic + XGB
+    needs: [train, train_xgb]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print current times (UTC & Edmonton)
+        run: |
+          echo "UTC:       $(date -u)"
+          TZ=America/Edmonton date +"%Y-%m-%d %H:%M:%S %Z"
+
+      - uses: actions/checkout@v4
+
+      - name: Download features
+        uses: actions/download-artifact@v4
+        with:
+          name: team_features
+          path: data/processed
+
+      - name: Download logistic artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: model_artifacts
+          path: models
+
+      - name: Download xgb artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: xgb_artifacts
+          path: models
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install polars scikit-learn xgboost numpy
+
+      - name: Fit blend
+        run: |
+          python scripts/blend_models.py \
+            --features data/processed/team_week_features.csv \
+            --logit_model models/nfl_model.json \
+            --xgb_model models/xgb_model.json \
+            --out_model models/blended_model.json \
+            --out_metrics models/blend_metrics.json
+
+      - name: Upload blended artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: blended_artifacts
+          path: |
+            models/blended_model.json
+            models/blend_metrics.json
           retention-days: 30
 
   calibrate:
