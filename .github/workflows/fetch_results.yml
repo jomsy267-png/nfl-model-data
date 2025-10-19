@@ -42,7 +42,7 @@ jobs:
           echo "AGG_GOT=$got" >> $GITHUB_ENV
 
       - name: Split aggregated schedules into per-season files (if found)
-        if: env.AGG_GOT == '1'
+        if: ${{ env.AGG_GOT == '1' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -69,7 +69,7 @@ PY
           rm -f schedules_all.csv
 
       - name: Try per-season schedules directly (fallback)
-        if: env.AGG_GOT != '1'
+        if: ${{ env.AGG_GOT != '1' }}
         shell: bash
         run: |
           set -euo pipefail
