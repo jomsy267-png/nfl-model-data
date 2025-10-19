@@ -167,7 +167,23 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: team_features
-          path: data/processed
+        # keep default path (= ./team_features)
+
+      - name: Inspect workspace (before training)
+        run: |
+          echo "PWD: $(pwd)"
+          echo "--- tree (top) ---"
+          ls -la
+          echo "--- team_features ---"
+          ls -la team_features || true
+          echo "--- data/processed (if exists) ---"
+          ls -la data/processed || true
+
+      - name: Move features into expected path
+        run: |
+          mkdir -p data/processed models
+          cp team_features/team_week_features.csv data/processed/team_week_features.csv
+          echo "Copied features to data/processed/team_week_features.csv"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -182,11 +198,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python scripts/train_model.py \
-            --features data/processed/team_week_features.csv \
-            --out_model models/nfl_model.json \
-            --out_metrics models/training_metrics.json \
-            --out_latest_features models/latest_team_features.csv
+          python scripts/train_model.py --features data/processed/team_week_features.csv --out_model models/nfl_model.json --out_metrics models/training_metrics.json --out_latest_features models/latest_team_features.csv
+
+      - name: Show produced model files
+        run: |
+          echo "--- models dir ---"
+          ls -la models || true
+          echo "--- metrics preview ---"
+          test -f models/training_metrics.json && head -n 50 models/training_metrics.json || echo "metrics missing"
+          echo "--- latest features preview ---"
+          test -f models/latest_team_features.csv && head -n 5 models/latest_team_features.csv || echo "latest features missing"
+
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: model_artifacts
+          path: |
+            models/nfl_model.json
+            models/training_metrics.json
+            models/latest_team_features.csv
+          # 'error' will fail the job if any path is missing, so we notice right away
+          if-no-files-found: error
+          retention-days: 30
+
 
   predict_and_report:
     name: Score upcoming games + report
