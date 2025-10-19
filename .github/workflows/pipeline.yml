@@ -1,9 +1,13 @@
 name: nfl-pipeline
 on:
+  # Run manually anytime
   workflow_dispatch:
-
-permissions:
-  contents: write
+  # Run daily at 10:00 AM America/Edmonton, accounting for DST shift
+  schedule:
+    # Approx. DST window (MDT): second Sunday in March → first Sunday in November
+    - cron: "0 16 * 3-10 *"
+    # Approx. non-DST window (MST): November → February
+    - cron: "0 17 * 11,12,1,2 *"
 
 jobs:
   fetch_schedules:
